@@ -10,6 +10,9 @@
 //   cargo run --release -- jogar 3 x.rede     -> idem, com pesos lidos de um arquivo
 //   cargo run --release -- uci [rede|x.rede]  -> protocolo UCI (para usar numa GUI
 //                                                ou contra outra engine, ex.: Maia)
+//   cargo run --release -- finais 10 finais.rede
+//                                             -> Etapa 2b: treina a rede nos finais de
+//                                                3 peças por 10 épocas e salva os pesos
 //
 // Sem arquivo, "rede" usa pesos aleatórios (semente fixa): ainda não há
 // treino nesta etapa, então ela joga mal de propósito.
@@ -17,7 +20,9 @@
 
 mod avaliacao;
 mod busca;
+mod finais;
 mod rede;
+mod treino;
 
 use avaliacao::{Avaliador, Material};
 use busca::{Busca, MATE};
@@ -180,6 +185,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(String::as_str);
     match arg(1) {
+        Some("finais") => {
+            let epocas = arg(2).and_then(|e| e.parse().ok()).unwrap_or(10);
+            treino::treinar_finais(epocas, arg(3).unwrap_or("finais.rede"));
+        }
         Some("uci") => match escolher_rede(arg(2)) {
             Some((rede, nome)) => uci(&rede, &nome),
             None => uci(&Material, "material"),
