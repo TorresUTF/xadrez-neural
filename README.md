@@ -15,7 +15,7 @@ cargo run --release -- syzygy syzygy 5 20000 10 syzygy.rede   # finais de 3 a 5 
 cargo run --release -- autojogo 200 64 auto.rede syzygy.rede  # Etapa 3: autojogo com TD-Leaf
 ```
 
-Para usar as tablebases: baixe os arquivos `.rtbw` de https://tablebase.lichess.ovh/tables/standard/3-4-5/ para a pasta `syzygy` e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).
+Para usar as tablebases: rode `powershell -ExecutionPolicy Bypass -File baixar_syzygy.ps1`, que baixa os arquivos `.rtbw` de até 5 peças para a pasta `syzygy`, e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).
 
 O `.cargo/config.toml` compila para o processador da máquina (`target-cpu=native`), o que deixa a rede cerca de 5 vezes mais rápida.
 

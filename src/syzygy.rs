@@ -6,7 +6,8 @@
 // posições por combinação de peças). As tablebases Syzygy já fizeram
 // esse trabalho e estão disponíveis para download:
 //
-//   até 5 peças: https://tablebase.lichess.ovh/tables/standard/3-4-5/   (~1 GB)
+//   até 5 peças: rode baixar_syzygy.ps1 (Windows), que acha a pasta certa em
+//                https://tablebase.lichess.ovh/tables/standard/
 //   6 peças:     na mesma página, pasta de 6 peças, só os .rtbw (dezenas de GB)
 //
 // Só os arquivos .rtbw (vitória/empate/derrota) são necessários aqui.
@@ -246,7 +247,10 @@ mod testes {
             return;
         }
         let mut tb = Tablebase::new();
-        tb.add_directory(&dir).unwrap();
+        if tb.add_directory(&dir).unwrap() == 0 {
+            eprintln!("(pasta {dir} sem arquivos .rtbw: teste pulado)");
+            return;
+        }
         let nossas = construir_todas();
         let mut rng = Aleatorio(3);
         let mut conferidas = 0;
