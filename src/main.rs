@@ -13,15 +13,23 @@
 //   cargo run --release -- finais 10 finais.rede
 //                                             -> Etapa 2b: treina a rede nos finais de
 //                                                3 peças por 10 épocas e salva os pesos
+//   cargo run --release -- syzygy pasta 5 5000 10 syzygy.rede [inicial.rede]
+//                                             -> treina com tablebases Syzygy: finais de 3 a 5
+//                                                peças, 5000 posições por combinação, 10 épocas
+//   cargo run --release -- autojogo 100 64 auto.rede [inicial.rede]
+//                                             -> Etapa 3: 100 rodadas de 64 partidas da rede
+//                                                contra si mesma (TD-Leaf), salvando em auto.rede
 //
 // Sem arquivo, "rede" usa pesos aleatórios (semente fixa): ainda não há
 // treino nesta etapa, então ela joga mal de propósito.
 // =====================================================================
 
+mod autojogo;
 mod avaliacao;
 mod busca;
 mod finais;
 mod rede;
+mod syzygy;
 mod treino;
 
 use avaliacao::{Avaliador, Material};
@@ -188,6 +196,19 @@ fn main() {
         Some("finais") => {
             let epocas = arg(2).and_then(|e| e.parse().ok()).unwrap_or(10);
             treino::treinar_finais(epocas, arg(3).unwrap_or("finais.rede"));
+        }
+        Some("syzygy") => {
+            let Some(pasta) = arg(2) else {
+                eprintln!("uso: syzygy <pasta das tablebases> [peças] [posições por combinação] [épocas] [saída] [inicial]");
+                std::process::exit(1);
+            };
+            let num = |i: usize, padrao: usize| arg(i).and_then(|e| e.parse().ok()).unwrap_or(padrao);
+            syzygy::treinar(pasta, num(3, 5), num(4, 5000), num(5, 10), arg(6).unwrap_or("syzygy.rede"), arg(7));
+        }
+        Some("autojogo") => {
+            let rodadas = arg(2).and_then(|e| e.parse().ok()).unwrap_or(100);
+            let partidas = arg(3).and_then(|e| e.parse().ok()).unwrap_or(64);
+            autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"));
         }
         Some("uci") => match escolher_rede(arg(2)) {
             Some((rede, nome)) => uci(&rede, &nome),

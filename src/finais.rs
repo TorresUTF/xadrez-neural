@@ -219,6 +219,27 @@ impl Tabela {
     }
 }
 
+// Valor exato para quem joga, se a posição tiver 3 peças ou menos e estiver
+// coberta (KQK, KRK, KPK, com a peça a mais de qualquer lado; rei contra rei).
+// Se a peça a mais é das pretas, espelhamos: cores trocadas, tabuleiro
+// virado e a vez trocada dão a mesma posição para quem joga.
+pub fn gabarito(tabelas: &[Tabela], pos: &Chess) -> Option<Valor> {
+    let n = pos.board().occupied().count();
+    if n == 2 {
+        return Some(Valor::Empate);
+    }
+    if n != 3 {
+        return None;
+    }
+    if let Some(v) = tabelas.iter().find_map(|t| t.consultar(pos)) {
+        return Some(v);
+    }
+    let mut setup = pos.to_setup(shakmaty::EnPassantMode::Legal);
+    setup.mirror();
+    let espelhada = Chess::from_setup(setup, CastlingMode::Standard).ok()?;
+    tabelas.iter().find_map(|t| t.consultar(&espelhada))
+}
+
 // As três tabelas, na ordem certa (KPK precisa das outras duas)
 pub fn construir_todas() -> Vec<Tabela> {
     let kqk = Tabela::construir(Role::Queen, &[]);
@@ -283,5 +304,16 @@ mod testes {
     #[test]
     fn dama_pendurada_com_pretas_jogando_e_empate() {
         assert_eq!(valor("8/8/8/8/8/2k5/2Q5/7K b - - 0 1"), Valor::Empate);
+    }
+
+    #[test]
+    fn gabarito_com_a_peca_nas_pretas() {
+        let t = tabelas();
+        let pos: Chess = "8/8/8/8/8/2q5/2K5/7k w - - 0 1".parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
+        assert_eq!(gabarito(t, &pos), Some(Valor::Empate)); // brancas tomam a dama
+        let pos: Chess = "8/8/8/8/8/8/2q5/K1k5 b - - 0 1".parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
+        assert_eq!(gabarito(t, &pos), Some(Valor::Vitoria));
+        let pos: Chess = "8/8/8/8/8/8/8/K1k5 b - - 0 1".parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
+        assert_eq!(gabarito(t, &pos), Some(Valor::Empate));
     }
 }
