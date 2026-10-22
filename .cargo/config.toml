@@ -1,0 +1,4 @@
+# Compila para o processador desta máquina (AVX2, FMA...). A rede fica ~5x
+# mais rápida que no modo genérico. O executável pode não rodar em outra CPU.
+[build]
+rustflags = ["-C", "target-cpu=native"]

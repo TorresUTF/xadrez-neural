@@ -21,7 +21,7 @@
 // Continua-se só com capturas e promoções até a posição ficar quieta.
 // =====================================================================
 
-use crate::avaliacao::{avaliar, valor};
+use crate::avaliacao::{valor, Avaliador};
 use shakmaty::{zobrist::Zobrist64, Chess, EnPassantMode, Move, MoveList, Position};
 
 // Nota de mate. Mate em menos lances vale mais: MATE - distância em meios-lances.
@@ -34,7 +34,8 @@ pub struct Resultado {
     pub nos: u64,   // posições visitadas (para medir o efeito da poda)
 }
 
-pub struct Busca {
+pub struct Busca<'a, A: Avaliador> {
+    avaliador: &'a A,
     nos: u64,
     // hashes das posições já vistas na partida e no ramo atual (repetição)
     historico: Vec<Zobrist64>,
@@ -55,11 +56,18 @@ fn ordenar(lances: &mut MoveList) {
     });
 }
 
-impl Busca {
+impl<'a, A: Avaliador> Busca<'a, A> {
     // `historico_partida`: hashes das posições anteriores da partida,
     // para a busca enxergar empate por repetição.
-    pub fn nova(historico_partida: Vec<Zobrist64>) -> Busca {
-        Busca { nos: 0, historico: historico_partida }
+    pub fn nova(avaliador: &'a A, historico_partida: Vec<Zobrist64>) -> Busca<'a, A> {
+        Busca { avaliador, nos: 0, historico: historico_partida }
+    }
+
+    // posição seguinte e o estado do avaliador nela (ex.: acumulador da rede)
+    fn jogar(&self, pos: &Chess, estado: &A::Estado, m: Move) -> (Chess, A::Estado) {
+        let filho = pos.clone().play(m).unwrap();
+        let estado_filho = self.avaliador.apos_lance(estado, pos, &filho);
+        (filho, estado_filho)
     }
 
     pub fn melhor_lance(&mut self, pos: &Chess, profundidade: u32) -> Resultado {
@@ -69,10 +77,11 @@ impl Busca {
 
         let mut melhor = None;
         let mut alfa = -INFINITO;
+        let estado = self.avaliador.inicio(pos);
         self.historico.push(hash(pos));
         for m in lances {
-            let filho = pos.clone().play(m).unwrap();
-            let nota = -self.negamax(&filho, profundidade - 1, 1, -INFINITO, -alfa);
+            let (filho, est) = self.jogar(pos, &estado, m);
+            let nota = -self.negamax(&filho, &est, profundidade - 1, 1, -INFINITO, -alfa);
             if nota > alfa {
                 alfa = nota;
                 melhor = Some(m);
@@ -95,7 +104,7 @@ impl Busca {
     }
 
     // `ply` = distância até a raiz, para preferir o mate mais curto
-    fn negamax(&mut self, pos: &Chess, profundidade: u32, ply: i32, mut alfa: i32, beta: i32) -> i32 {
+    fn negamax(&mut self, pos: &Chess, estado: &A::Estado, profundidade: u32, ply: i32, mut alfa: i32, beta: i32) -> i32 {
         self.nos += 1;
 
         if self.eh_empate(pos) {
@@ -106,14 +115,14 @@ impl Busca {
             return if pos.is_check() { -(MATE - ply) } else { 0 };
         }
         if profundidade == 0 {
-            return self.quiescencia(pos, alfa, beta);
+            return self.quiescencia(pos, estado, alfa, beta);
         }
 
         ordenar(&mut lances);
         self.historico.push(hash(pos));
         for m in lances {
-            let filho = pos.clone().play(m).unwrap();
-            let nota = -self.negamax(&filho, profundidade - 1, ply + 1, -beta, -alfa);
+            let (filho, est) = self.jogar(pos, estado, m);
+            let nota = -self.negamax(&filho, &est, profundidade - 1, ply + 1, -beta, -alfa);
             if nota >= beta {
                 self.historico.pop();
                 return beta; // corte beta: o adversário não deixaria chegar aqui
@@ -124,13 +133,13 @@ impl Busca {
         alfa
     }
 
-    fn quiescencia(&mut self, pos: &Chess, mut alfa: i32, beta: i32) -> i32 {
+    fn quiescencia(&mut self, pos: &Chess, estado: &A::Estado, mut alfa: i32, beta: i32) -> i32 {
         self.nos += 1;
 
         // "Ficar parado": quem joga pode recusar todas as capturas, então
         // a nota estática é um piso. (Simplificação: em xeque isso não vale
         // de verdade, mas é o padrão nesta etapa.)
-        let parado = avaliar(pos);
+        let parado = self.avaliador.nota(estado, pos);
         if parado >= beta {
             return beta;
         }
@@ -140,8 +149,8 @@ impl Busca {
         lances.retain(|m| m.is_capture() || m.is_promotion());
         ordenar(&mut lances);
         for m in lances {
-            let filho = pos.clone().play(m).unwrap();
-            let nota = -self.quiescencia(&filho, -beta, -alfa);
+            let (filho, est) = self.jogar(pos, estado, m);
+            let nota = -self.quiescencia(&filho, &est, -beta, -alfa);
             if nota >= beta {
                 return beta;
             }
@@ -154,6 +163,8 @@ impl Busca {
 #[cfg(test)]
 mod testes {
     use super::*;
+    use crate::avaliacao::Material;
+    use crate::rede::Rede;
     use shakmaty::{fen::Fen, uci::UciMove, CastlingMode};
 
     fn de_fen(fen: &str) -> Chess {
@@ -161,7 +172,7 @@ mod testes {
     }
 
     fn lance_uci(pos: &Chess, prof: u32) -> String {
-        let r = Busca::nova(vec![]).melhor_lance(pos, prof);
+        let r = Busca::nova(&Material, vec![]).melhor_lance(pos, prof);
         UciMove::from_standard(r.lance.unwrap()).to_string()
     }
 
@@ -170,7 +181,7 @@ mod testes {
         // mate do corredor: Ra8#
         let pos = de_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1");
         assert_eq!(lance_uci(&pos, 3), "a1a8");
-        let r = Busca::nova(vec![]).melhor_lance(&pos, 3);
+        let r = Busca::nova(&Material, vec![]).melhor_lance(&pos, 3);
         assert_eq!(r.nota, MATE - 1);
     }
 
@@ -192,7 +203,7 @@ mod testes {
     fn afogamento_vale_zero() {
         let pos = de_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1");
         assert!(pos.is_stalemate());
-        assert_eq!(Busca::nova(vec![]).melhor_lance(&pos, 3).nota, 0);
+        assert_eq!(Busca::nova(&Material, vec![]).melhor_lance(&pos, 3).nota, 0);
     }
 
     #[test]
@@ -204,7 +215,7 @@ mod testes {
                 return if pos.is_check() { -(MATE - ply) } else { 0 };
             }
             if prof == 0 {
-                return Busca::nova(vec![]).quiescencia(pos, -INFINITO, INFINITO);
+                return Busca::nova(&Material, vec![]).quiescencia(pos, &(), -INFINITO, INFINITO);
             }
             lances
                 .iter()
@@ -213,7 +224,41 @@ mod testes {
                 .unwrap()
         }
         let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
-        let r = Busca::nova(vec![]).melhor_lance(&pos, 3);
+        let r = Busca::nova(&Material, vec![]).melhor_lance(&pos, 3);
         assert_eq!(r.nota, minimax(&pos, 3, 0));
+    }
+
+    #[test]
+    fn busca_com_rede_igual_ao_minimax() {
+        // O mesmo teste com a rede (pesos aleatórios): a poda e o acumulador
+        // incremental não podem mudar a nota.
+        fn minimax(rede: &Rede, pos: &Chess, prof: u32, ply: i32) -> i32 {
+            let lances = pos.legal_moves();
+            if lances.is_empty() {
+                return if pos.is_check() { -(MATE - ply) } else { 0 };
+            }
+            if prof == 0 {
+                let acc = rede.inicio(pos);
+                return Busca::nova(rede, vec![]).quiescencia(pos, &acc, -INFINITO, INFINITO);
+            }
+            lances
+                .iter()
+                .map(|&m| -minimax(rede, &pos.clone().play(m).unwrap(), prof - 1, ply + 1))
+                .max()
+                .unwrap()
+        }
+        let rede = Rede::aleatoria(11);
+        let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
+        let r = Busca::nova(&rede, vec![]).melhor_lance(&pos, 2);
+        assert_eq!(r.nota, minimax(&rede, &pos, 2, 0));
+    }
+
+    #[test]
+    fn rede_ainda_ve_mate() {
+        // mate não depende da avaliação: mesmo com pesos aleatórios
+        let rede = Rede::aleatoria(12);
+        let pos = de_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1");
+        let r = Busca::nova(&rede, vec![]).melhor_lance(&pos, 3);
+        assert_eq!(UciMove::from_standard(r.lance.unwrap()).to_string(), "a1a8");
     }
 }
