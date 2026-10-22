@@ -1,9 +1,14 @@
 // =====================================================================
-// AVALIAÇÃO — Etapa 1: só contagem de material
+// AVALIAÇÃO — o que a busca chama nas folhas
 // =====================================================================
 //
-// Esta é a linha de base. Na Etapa 2, esta função será trocada pela
-// rede neural (768 -> 256 -> 32 -> 3, saída vitória/empate/derrota).
+// Dois avaliadores com a mesma interface (o trait `Avaliador`):
+//   Material — Etapa 1, só contagem de material. É a linha de base.
+//   Rede     — Etapa 2, a rede 768 -> 256 -> 32 -> 3 (vitória/empate/derrota).
+//
+// A busca não sabe qual dos dois está usando. Cada avaliador pode levar
+// um "estado" de lance em lance: a rede leva o acumulador (atualização
+// incremental, ver rede.rs); o material não precisa de nada.
 //
 // Convenção: a nota é sempre do ponto de vista de QUEM JOGA.
 // Positivo = bom para quem tem a vez. Isso evita o erro de sinal
@@ -12,7 +17,47 @@
 // Unidade: centipeões (100 = um peão).
 // =====================================================================
 
+use crate::rede::{Acumulador, Rede, DERROTA, VITORIA};
 use shakmaty::{Chess, Position, Role};
+
+pub trait Avaliador {
+    type Estado: Clone;
+    // estado da posição da raiz, calculado do zero
+    fn inicio(&self, pos: &Chess) -> Self::Estado;
+    // estado depois de um lance, a partir do estado de antes
+    fn apos_lance(&self, estado: &Self::Estado, antes: &Chess, depois: &Chess) -> Self::Estado;
+    // nota do ponto de vista de quem joga
+    fn nota(&self, estado: &Self::Estado, pos: &Chess) -> i32;
+}
+
+pub struct Material;
+
+impl Avaliador for Material {
+    type Estado = ();
+    fn inicio(&self, _: &Chess) {}
+    fn apos_lance(&self, _: &(), _: &Chess, _: &Chess) {}
+    fn nota(&self, _: &(), pos: &Chess) -> i32 {
+        avaliar(pos)
+    }
+}
+
+// A rede dá v = P_V - P_D entre -1 e +1; a busca trabalha com inteiros.
+// Multiplicamos por 1000: v = 0,25 vira nota 250.
+pub const ESCALA_REDE: f32 = 1000.0;
+
+impl Avaliador for Rede {
+    type Estado = Acumulador;
+    fn inicio(&self, pos: &Chess) -> Acumulador {
+        self.acumulador(pos.board())
+    }
+    fn apos_lance(&self, acc: &Acumulador, antes: &Chess, depois: &Chess) -> Acumulador {
+        self.atualizar(acc, antes.board(), depois.board())
+    }
+    fn nota(&self, acc: &Acumulador, pos: &Chess) -> i32 {
+        let p = self.probabilidades(acc, pos.turn());
+        ((p[VITORIA] - p[DERROTA]) * ESCALA_REDE).round() as i32
+    }
+}
 
 pub const VALOR_PEAO: i32 = 100;
 pub const VALOR_CAVALO: i32 = 320;

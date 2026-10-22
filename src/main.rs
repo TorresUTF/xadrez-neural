@@ -1,18 +1,27 @@
 // =====================================================================
-// ETAPA 1 — Motor de xadrez sem rede neural (a linha de base)
+// Motor de xadrez: busca alfa-beta + avaliação por material (Etapa 1)
+// ou pela rede neural (Etapa 2)
 // =====================================================================
 //
 // Uso:
-//   cargo run --release                 -> o motor joga uma partida contra si mesmo
-//   cargo run --release -- jogar 4      -> idem, com profundidade 4
-//   cargo run --release -- uci          -> protocolo UCI (para usar numa GUI
-//                                          ou contra outra engine, ex.: Maia)
+//   cargo run --release                       -> o motor joga uma partida contra si mesmo
+//   cargo run --release -- jogar 4            -> idem, com profundidade 4
+//   cargo run --release -- jogar 3 rede       -> idem, avaliando com a rede (Etapa 2)
+//   cargo run --release -- jogar 3 x.rede     -> idem, com pesos lidos de um arquivo
+//   cargo run --release -- uci [rede|x.rede]  -> protocolo UCI (para usar numa GUI
+//                                                ou contra outra engine, ex.: Maia)
+//
+// Sem arquivo, "rede" usa pesos aleatórios (semente fixa): ainda não há
+// treino nesta etapa, então ela joga mal de propósito.
 // =====================================================================
 
 mod avaliacao;
 mod busca;
+mod rede;
 
+use avaliacao::{Avaliador, Material};
 use busca::{Busca, MATE};
+use rede::Rede;
 use shakmaty::{
     fen::Fen, san::SanPlus, uci::UciMove, zobrist::Zobrist64, CastlingMode, Chess, EnPassantMode,
     Outcome, Position,
@@ -50,7 +59,7 @@ fn fim_de_partida(pos: &Chess, historico: &[Zobrist64]) -> Option<String> {
     None
 }
 
-fn jogar_contra_si(profundidade: u32) {
+fn jogar_contra_si<A: Avaliador>(avaliador: &A, profundidade: u32) {
     let mut pos = Chess::default();
     let mut historico: Vec<Zobrist64> = Vec::new();
     let mut pgn = String::new();
@@ -62,7 +71,7 @@ fn jogar_contra_si(profundidade: u32) {
         if let Some(fim) = fim_de_partida(&pos, &historico) {
             break fim;
         }
-        let r = Busca::nova(historico.clone()).melhor_lance(&pos, profundidade);
+        let r = Busca::nova(avaliador, historico.clone()).melhor_lance(&pos, profundidade);
         let m = r.lance.unwrap();
         nos_total += r.nos;
 
@@ -94,7 +103,7 @@ fn jogar_contra_si(profundidade: u32) {
 }
 
 // UCI mínimo: o suficiente para uma GUI (ou um script de torneio) usar o motor.
-fn uci() {
+fn uci<A: Avaliador>(avaliador: &A, nome: &str) {
     let mut pos = Chess::default();
     let mut historico: Vec<Zobrist64> = Vec::new();
     let mut saida = io::stdout();
@@ -104,7 +113,7 @@ fn uci() {
         let partes: Vec<&str> = linha.split_whitespace().collect();
         match partes.first().copied() {
             Some("uci") => {
-                println!("id name xadrez-neural (etapa 1, material)");
+                println!("id name xadrez-neural ({nome})");
                 println!("id author Gabriel");
                 println!("uciok");
             }
@@ -138,7 +147,7 @@ fn uci() {
                     .position(|&p| p == "depth")
                     .and_then(|i| partes.get(i + 1)?.parse().ok())
                     .unwrap_or(PROFUNDIDADE_PADRAO);
-                let r = Busca::nova(historico.clone()).melhor_lance(&pos, profundidade);
+                let r = Busca::nova(avaliador, historico.clone()).melhor_lance(&pos, profundidade);
                 println!("info depth {profundidade} score cp {} nodes {}", r.nota.clamp(-30000, 30000), r.nos);
                 match r.lance {
                     Some(m) => println!("bestmove {}", UciMove::from_standard(m)),
@@ -152,13 +161,38 @@ fn uci() {
     }
 }
 
+// "material" (padrão), "rede" (pesos aleatórios) ou um arquivo de pesos
+fn escolher_rede(arg: Option<&str>) -> Option<(Rede, String)> {
+    match arg {
+        None | Some("material") => None,
+        Some("rede") => Some((Rede::aleatoria(0x2545F4914F6CDD1D), "rede aleatória".into())),
+        Some(arquivo) => match Rede::carregar(arquivo) {
+            Ok(r) => Some((r, format!("rede {arquivo}"))),
+            Err(e) => {
+                eprintln!("Não consegui ler {arquivo}: {e}");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("uci") => uci(),
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    match arg(1) {
+        Some("uci") => match escolher_rede(arg(2)) {
+            Some((rede, nome)) => uci(&rede, &nome),
+            None => uci(&Material, "material"),
+        },
         _ => {
-            let profundidade = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(PROFUNDIDADE_PADRAO);
-            jogar_contra_si(profundidade.max(1));
+            let profundidade = arg(2).and_then(|p| p.parse().ok()).unwrap_or(PROFUNDIDADE_PADRAO).max(1);
+            match escolher_rede(arg(3)) {
+                Some((rede, nome)) => {
+                    println!("Avaliação: {nome}");
+                    jogar_contra_si(&rede, profundidade)
+                }
+                None => jogar_contra_si(&Material, profundidade),
+            }
         }
     }
 }
