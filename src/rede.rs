@@ -41,7 +41,6 @@ pub const N_OCULTA2: usize = 32;
 pub const N_SAIDAS: usize = 3; // 0 = vitória, 1 = empate, 2 = derrota
 
 pub const VITORIA: usize = 0;
-#[allow(dead_code)] // usado no treino (Etapa 2b)
 pub const EMPATE: usize = 1;
 pub const DERROTA: usize = 2;
 
@@ -80,7 +79,6 @@ pub struct Acumulador {
     pub z1: [[f32; N_OCULTA1]; 2],
 }
 
-#[allow(dead_code)] // z1, h1, z2, h2: lidos só na retropropagação (Etapa 2b)
 pub struct Ativacoes {
     pub z1: [f32; N_OCULTA1],
     pub h1: [f32; N_OCULTA1],
@@ -93,7 +91,6 @@ fn crelu(z: f32) -> f32 {
     z.clamp(0.0, 1.0)
 }
 
-#[allow(dead_code)]
 fn crelu_derivada(z: f32) -> f32 {
     if z > 0.0 && z < 1.0 { 1.0 } else { 0.0 }
 }
@@ -236,16 +233,8 @@ impl Rede {
         self.para_frente(&acc.z1[indice_cor(quem_joga)]).p
     }
 
-    // -----------------------------------------------------------------
-    // PASSO PARA TRÁS (para as Etapas 2b e 3; aqui só os testes o usam)
-    // Recebe as entradas ligadas (já do ponto de vista de quem joga) e o
-    // alvo t = (t_V, t_E, t_D). Soma os gradientes em `g` e devolve o erro
-    //      L = -soma_k t_k ln p_k        (entropia cruzada)
-    // É a mesma regra da cadeia da Etapa 0, com uma camada a mais.
-    // -----------------------------------------------------------------
-    // os índices s, k, j seguem as fórmulas, por isso laços com índice
-    #[allow(dead_code, clippy::needless_range_loop)]
-    pub fn retropropagar(&self, ligadas: &[usize], alvo: [f32; N_SAIDAS], g: &mut Rede) -> f32 {
+    // z1 calculado do zero a partir das entradas ligadas (sem acumulador)
+    fn z1_de(&self, ligadas: &[usize]) -> [f32; N_OCULTA1] {
         let mut z1 = [0.0; N_OCULTA1];
         z1.copy_from_slice(&self.b1);
         for &i in ligadas {
@@ -253,7 +242,25 @@ impl Rede {
                 *zj += wj;
             }
         }
-        let a = self.para_frente(&z1);
+        z1
+    }
+
+    // (P_V, P_E, P_D) a partir das entradas ligadas, já do ponto de vista de quem joga
+    pub fn probabilidades_de(&self, ligadas: &[usize]) -> [f32; N_SAIDAS] {
+        self.para_frente(&self.z1_de(ligadas)).p
+    }
+
+    // -----------------------------------------------------------------
+    // PASSO PARA TRÁS (usado no treino: treino.rs)
+    // Recebe as entradas ligadas (já do ponto de vista de quem joga) e o
+    // alvo t = (t_V, t_E, t_D). Soma os gradientes em `g` e devolve o erro
+    //      L = -soma_k t_k ln p_k        (entropia cruzada)
+    // É a mesma regra da cadeia da Etapa 0, com uma camada a mais.
+    // -----------------------------------------------------------------
+    // os índices s, k, j seguem as fórmulas, por isso laços com índice
+    #[allow(clippy::needless_range_loop)]
+    pub fn retropropagar(&self, ligadas: &[usize], alvo: [f32; N_SAIDAS], g: &mut Rede) -> f32 {
+        let a = self.para_frente(&self.z1_de(ligadas));
         let erro = -(0..N_SAIDAS).map(|s| alvo[s] * a.p[s].max(1e-12).ln()).sum::<f32>();
 
         // 1) Saída: com softmax + entropia cruzada, dL/dz3 = p - t
@@ -294,12 +301,17 @@ impl Rede {
         erro
     }
 
+    pub fn zerar(&mut self) {
+        for v in self.parametros_mut() {
+            v.iter_mut().for_each(|x| *x = 0.0);
+        }
+    }
+
     fn parametros_mut(&mut self) -> [&mut Vec<f32>; 6] {
         [&mut self.w1, &mut self.b1, &mut self.w2, &mut self.b2, &mut self.w3, &mut self.b3]
     }
 
     // Gradiente descendente: w <- w - taxa * g / n   (n = exemplos no lote)
-    #[allow(dead_code)]
     pub fn aplicar(&mut self, g: &mut Rede, taxa: f32, n: usize) {
         for (w, gw) in self.parametros_mut().into_iter().zip(g.parametros_mut()) {
             for (wi, gi) in w.iter_mut().zip(gw.iter()) {
@@ -314,7 +326,6 @@ impl Rede {
     // -----------------------------------------------------------------
     const ASSINATURA: &'static [u8; 4] = b"XNR1";
 
-    #[allow(dead_code)]
     pub fn salvar(&mut self, arquivo: &str) -> io::Result<()> {
         let mut f = io::BufWriter::new(std::fs::File::create(arquivo)?);
         f.write_all(Self::ASSINATURA)?;
