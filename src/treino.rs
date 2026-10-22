@@ -75,15 +75,11 @@ const LOTE: usize = 256;
 pub const TAXA: f32 = 1e-3;
 
 // Uma época: embaralha e passa por todos os lotes. Devolve o erro médio.
-pub fn epoca(rede: &mut Rede, g: &mut Rede, adam: &mut Adam, treino: &mut [&Exemplo], rng: &mut Aleatorio) -> f32 {
+pub fn epoca(rede: &mut Rede, gs: &mut [Rede], adam: &mut Adam, treino: &mut [&Exemplo], rng: &mut Aleatorio) -> f32 {
     embaralhar(treino, rng);
     let mut erro = 0.0f64;
     for lote in treino.chunks(LOTE) {
-        g.zerar();
-        for e in lote {
-            erro += rede.retropropagar(&e.ligadas, alvo(e.classe), g) as f64;
-        }
-        rede.aplicar_adam(g, adam, lote.len());
+        erro += rede.treinar_lote(gs, adam, lote, |e| (&e.ligadas, alvo(e.classe)));
     }
     (erro / treino.len() as f64) as f32
 }
@@ -155,14 +151,14 @@ pub fn treinar_supervisionado(rede: &mut Rede, mut todos: Vec<Exemplo>, nomes: &
     let mut treino: Vec<&Exemplo> = treino.iter().collect();
     println!("{} exemplos de treino, {} de validação\n", treino.len(), validacao.len());
 
-    let mut g = Rede::zerada();
+    let mut gs = Rede::gradientes();
     let mut adam = Adam::novo(TAXA);
 
     let m = medir(rede, &validacao);
     println!("época  0: validação erro {:.4}  acerto {:5.1}%  P(certa) {:.3}", m.erro, 100.0 * m.acerto, m.p_certa);
     for n in 1..=epocas {
         let t0 = Instant::now();
-        let erro_treino = epoca(rede, &mut g, &mut adam, &mut treino, &mut rng);
+        let erro_treino = epoca(rede, &mut gs, &mut adam, &mut treino, &mut rng);
         let m = medir(rede, &validacao);
         println!(
             "época {n:2}: treino erro {erro_treino:.4} | validação erro {:.4}  acerto {:5.1}%  P(certa) {:.3}  ({:.1} s)",
@@ -210,7 +206,7 @@ mod testes {
         let validacao: Vec<&Exemplo> = validacao.iter().collect();
         let mut treino: Vec<&Exemplo> = treino.iter().collect();
         let mut rede = Rede::aleatoria(1);
-        epoca(&mut rede, &mut Rede::zerada(), &mut Adam::novo(TAXA), &mut treino, &mut rng);
+        epoca(&mut rede, &mut Rede::gradientes(), &mut Adam::novo(TAXA), &mut treino, &mut rng);
         let m = medir(&rede, &validacao);
         assert!(m.acerto > 0.9, "acerto {}", m.acerto);
     }
