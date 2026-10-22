@@ -28,10 +28,18 @@ use shakmaty::{zobrist::Zobrist64, Chess, EnPassantMode, Move, MoveList, Positio
 pub const MATE: i32 = 1_000_000;
 const INFINITO: i32 = MATE + 1;
 
+// Limite de meios-lances na quiescência. Sem limite, uma rede ainda ruim
+// pode achar "boas" longas sequências de capturas e a busca explode.
+pub const MAX_QUIESCENCIA: u32 = 8;
+
 pub struct Resultado {
     pub lance: Option<Move>,
     pub nota: i32,  // centipeões, do ponto de vista de quem joga
     pub nos: u64,   // posições visitadas (para medir o efeito da poda)
+    // Linha principal (PV): a sequência de lances que a busca espera, dos
+    // dois lados. A posição no fim dela é a "folha" cuja avaliação deu a
+    // nota da raiz; é ela que o TD-Leaf treina (Etapa 3).
+    pub pv: Vec<Move>,
 }
 
 pub struct Busca<'a, A: Avaliador> {
@@ -77,21 +85,24 @@ impl<'a, A: Avaliador> Busca<'a, A> {
 
         let mut melhor = None;
         let mut alfa = -INFINITO;
+        let mut pv = Vec::new();
         let estado = self.avaliador.inicio(pos);
         self.historico.push(hash(pos));
         for m in lances {
             let (filho, est) = self.jogar(pos, &estado, m);
-            let nota = -self.negamax(&filho, &est, profundidade - 1, 1, -INFINITO, -alfa);
+            let mut pv_filho = Vec::new();
+            let nota = -self.negamax(&filho, &est, profundidade - 1, 1, -INFINITO, -alfa, &mut pv_filho);
             if nota > alfa {
                 alfa = nota;
                 melhor = Some(m);
+                pv = std::iter::once(m).chain(pv_filho).collect();
             }
         }
         self.historico.pop();
 
         // sem lances: mate ou afogamento
         let nota = if melhor.is_some() { alfa } else if pos.is_check() { -MATE } else { 0 };
-        Resultado { lance: melhor, nota, nos: self.nos }
+        Resultado { lance: melhor, nota, nos: self.nos, pv }
     }
 
     fn eh_empate(&self, pos: &Chess) -> bool {
@@ -103,8 +114,20 @@ impl<'a, A: Avaliador> Busca<'a, A> {
         self.historico.iter().rev().take(pos.halfmoves() as usize).any(|&x| x == h)
     }
 
-    // `ply` = distância até a raiz, para preferir o mate mais curto
-    fn negamax(&mut self, pos: &Chess, estado: &A::Estado, profundidade: u32, ply: i32, mut alfa: i32, beta: i32) -> i32 {
+    // `ply` = distância até a raiz, para preferir o mate mais curto.
+    // `pv` recebe a linha principal a partir daqui (quando a nota fica
+    // dentro da janela; num corte ela não importa).
+    #[allow(clippy::too_many_arguments)]
+    fn negamax(
+        &mut self,
+        pos: &Chess,
+        estado: &A::Estado,
+        profundidade: u32,
+        ply: i32,
+        mut alfa: i32,
+        beta: i32,
+        pv: &mut Vec<Move>,
+    ) -> i32 {
         self.nos += 1;
 
         if self.eh_empate(pos) {
@@ -115,25 +138,37 @@ impl<'a, A: Avaliador> Busca<'a, A> {
             return if pos.is_check() { -(MATE - ply) } else { 0 };
         }
         if profundidade == 0 {
-            return self.quiescencia(pos, estado, alfa, beta);
+            return self.quiescencia(pos, estado, alfa, beta, MAX_QUIESCENCIA, pv);
         }
 
         ordenar(&mut lances);
         self.historico.push(hash(pos));
         for m in lances {
             let (filho, est) = self.jogar(pos, estado, m);
-            let nota = -self.negamax(&filho, &est, profundidade - 1, ply + 1, -beta, -alfa);
+            let mut pv_filho = Vec::new();
+            let nota = -self.negamax(&filho, &est, profundidade - 1, ply + 1, -beta, -alfa, &mut pv_filho);
             if nota >= beta {
                 self.historico.pop();
                 return beta; // corte beta: o adversário não deixaria chegar aqui
             }
-            alfa = alfa.max(nota);
+            if nota > alfa {
+                alfa = nota;
+                *pv = std::iter::once(m).chain(pv_filho).collect();
+            }
         }
         self.historico.pop();
         alfa
     }
 
-    fn quiescencia(&mut self, pos: &Chess, estado: &A::Estado, mut alfa: i32, beta: i32) -> i32 {
+    fn quiescencia(
+        &mut self,
+        pos: &Chess,
+        estado: &A::Estado,
+        mut alfa: i32,
+        beta: i32,
+        restante: u32,
+        pv: &mut Vec<Move>,
+    ) -> i32 {
         self.nos += 1;
 
         // "Ficar parado": quem joga pode recusar todas as capturas, então
@@ -144,17 +179,24 @@ impl<'a, A: Avaliador> Busca<'a, A> {
             return beta;
         }
         alfa = alfa.max(parado);
+        if restante == 0 {
+            return alfa;
+        }
 
         let mut lances = pos.legal_moves();
         lances.retain(|m| m.is_capture() || m.is_promotion());
         ordenar(&mut lances);
         for m in lances {
             let (filho, est) = self.jogar(pos, estado, m);
-            let nota = -self.quiescencia(&filho, &est, -beta, -alfa);
+            let mut pv_filho = Vec::new();
+            let nota = -self.quiescencia(&filho, &est, -beta, -alfa, restante - 1, &mut pv_filho);
             if nota >= beta {
                 return beta;
             }
-            alfa = alfa.max(nota);
+            if nota > alfa {
+                alfa = nota;
+                *pv = std::iter::once(m).chain(pv_filho).collect();
+            }
         }
         alfa
     }
@@ -215,7 +257,7 @@ mod testes {
                 return if pos.is_check() { -(MATE - ply) } else { 0 };
             }
             if prof == 0 {
-                return Busca::nova(&Material, vec![]).quiescencia(pos, &(), -INFINITO, INFINITO);
+                return Busca::nova(&Material, vec![]).quiescencia(pos, &(), -INFINITO, INFINITO, MAX_QUIESCENCIA, &mut vec![]);
             }
             lances
                 .iter()
@@ -239,7 +281,7 @@ mod testes {
             }
             if prof == 0 {
                 let acc = rede.inicio(pos);
-                return Busca::nova(rede, vec![]).quiescencia(pos, &acc, -INFINITO, INFINITO);
+                return Busca::nova(rede, vec![]).quiescencia(pos, &acc, -INFINITO, INFINITO, MAX_QUIESCENCIA, &mut vec![]);
             }
             lances
                 .iter()
@@ -260,5 +302,28 @@ mod testes {
         let pos = de_fen("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1");
         let r = Busca::nova(&rede, vec![]).melhor_lance(&pos, 3);
         assert_eq!(UciMove::from_standard(r.lance.unwrap()).to_string(), "a1a8");
+    }
+
+    #[test]
+    fn nota_da_raiz_e_a_nota_da_folha_da_pv() {
+        // O coração do TD-Leaf: a nota que a busca dá à raiz é exatamente a
+        // avaliação estática da folha da linha principal (com o sinal de
+        // quem joga na raiz).
+        use crate::avaliacao::avaliar;
+        for fen in [
+            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+            "4k3/8/4p3/3p4/8/2N5/8/4K3 w - - 0 1",
+            "r2qk2r/ppp2ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPP2PPP/R2QK2R w KQkq - 0 7",
+        ] {
+            let pos = de_fen(fen);
+            let r = Busca::nova(&Material, vec![]).melhor_lance(&pos, 3);
+            let mut folha = pos.clone();
+            for &m in &r.pv {
+                folha = folha.play(m).unwrap();
+            }
+            let sinal = if r.pv.len().is_multiple_of(2) { 1 } else { -1 };
+            assert_eq!(r.nota, sinal * avaliar(&folha), "{fen}");
+            assert!(r.pv.len() >= 3, "{fen}");
+        }
     }
 }

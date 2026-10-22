@@ -10,7 +10,7 @@
 //     embaralha os exemplos
 //     para cada lote de N exemplos:
 //       soma os gradientes dos N (retropropagação)
-//       w <- w - taxa * gradiente médio
+//       ajusta os pesos com o gradiente médio (otimizador Adam, ver rede.rs)
 //
 // 10% dos exemplos ficam separados (VALIDAÇÃO) e nunca são usados no
 // treino: é neles que medimos se a rede aprendeu o xadrez desses finais
@@ -18,7 +18,7 @@
 // =====================================================================
 
 use crate::finais::{construir_todas, Tabela};
-use crate::rede::{entradas, Aleatorio, Rede, N_SAIDAS};
+use crate::rede::{entradas, Adam, Aleatorio, Rede, N_SAIDAS};
 use shakmaty::Position;
 use std::time::Instant;
 
@@ -72,10 +72,10 @@ pub fn medir(rede: &Rede, exemplos: &[&Exemplo]) -> Medida {
 }
 
 const LOTE: usize = 256;
-const TAXA: f32 = 0.5;
+pub const TAXA: f32 = 1e-3;
 
 // Uma época: embaralha e passa por todos os lotes. Devolve o erro médio.
-pub fn epoca(rede: &mut Rede, g: &mut Rede, treino: &mut [&Exemplo], rng: &mut Aleatorio) -> f32 {
+pub fn epoca(rede: &mut Rede, g: &mut Rede, adam: &mut Adam, treino: &mut [&Exemplo], rng: &mut Aleatorio) -> f32 {
     embaralhar(treino, rng);
     let mut erro = 0.0f64;
     for lote in treino.chunks(LOTE) {
@@ -83,7 +83,7 @@ pub fn epoca(rede: &mut Rede, g: &mut Rede, treino: &mut [&Exemplo], rng: &mut A
         for e in lote {
             erro += rede.retropropagar(&e.ligadas, alvo(e.classe), g) as f64;
         }
-        rede.aplicar(g, TAXA, lote.len());
+        rede.aplicar_adam(g, adam, lote.len());
     }
     (erro / treino.len() as f64) as f32
 }
@@ -132,8 +132,22 @@ pub fn treinar_finais(epocas: usize, arquivo: &str) {
     }
     println!("  pronto em {:.1} s\n", inicio.elapsed().as_secs_f64());
 
-    let mut todos = exemplos(&tabelas);
-    let mut rng = Aleatorio(0x9E3779B97F4A7C15);
+    let todos = exemplos(&tabelas);
+    let mut rede = Rede::aleatoria(0x2545F4914F6CDD1D);
+    treinar_supervisionado(&mut rede, todos, &nomes, epocas);
+    mostrar_vitrine(&rede, &tabelas);
+
+    match rede.salvar(arquivo) {
+        Ok(()) => println!("\nPesos salvos em {arquivo}"),
+        Err(e) => println!("\nNão consegui salvar {arquivo}: {e}"),
+    }
+}
+
+
+// Treino supervisionado genérico: embaralha, separa 10% para validação,
+// treina `epocas` épocas e mostra o resultado por grupo (`nomes[final_]`).
+pub fn treinar_supervisionado(rede: &mut Rede, mut todos: Vec<Exemplo>, nomes: &[&str], epocas: usize) {
+        let mut rng = Aleatorio(0x9E3779B97F4A7C15);
     embaralhar(&mut todos, &mut rng);
     let corte = todos.len() / 10;
     let (validacao, treino) = todos.split_at(corte);
@@ -141,15 +155,15 @@ pub fn treinar_finais(epocas: usize, arquivo: &str) {
     let mut treino: Vec<&Exemplo> = treino.iter().collect();
     println!("{} exemplos de treino, {} de validação\n", treino.len(), validacao.len());
 
-    let mut rede = Rede::aleatoria(0x2545F4914F6CDD1D);
     let mut g = Rede::zerada();
+    let mut adam = Adam::novo(TAXA);
 
-    let m = medir(&rede, &validacao);
+    let m = medir(rede, &validacao);
     println!("época  0: validação erro {:.4}  acerto {:5.1}%  P(certa) {:.3}", m.erro, 100.0 * m.acerto, m.p_certa);
     for n in 1..=epocas {
         let t0 = Instant::now();
-        let erro_treino = epoca(&mut rede, &mut g, &mut treino, &mut rng);
-        let m = medir(&rede, &validacao);
+        let erro_treino = epoca(rede, &mut g, &mut adam, &mut treino, &mut rng);
+        let m = medir(rede, &validacao);
         println!(
             "época {n:2}: treino erro {erro_treino:.4} | validação erro {:.4}  acerto {:5.1}%  P(certa) {:.3}  ({:.1} s)",
             m.erro,
@@ -159,10 +173,10 @@ pub fn treinar_finais(epocas: usize, arquivo: &str) {
         );
     }
 
-    println!("\nPor final (validação):");
-    for (t, nome) in nomes.iter().enumerate() {
+    println!("\nPor grupo (validação):");
+    for (t, nome) in nomes.iter().enumerate().filter(|(_, n)| !n.is_empty()) {
         let deste: Vec<&Exemplo> = validacao.iter().copied().filter(|e| e.final_ == t).collect();
-        let m = medir(&rede, &deste);
+        let m = medir(rede, &deste);
         println!("  {nome}: acerto {:5.1}%  P(certa) {:.3}", 100.0 * m.acerto, m.p_certa);
     }
 
@@ -176,12 +190,6 @@ pub fn treinar_finais(epocas: usize, arquivo: &str) {
         100.0 * certas as f64 / validacao.len() as f64
     );
 
-    mostrar_vitrine(&rede, &tabelas);
-
-    match rede.salvar(arquivo) {
-        Ok(()) => println!("\nPesos salvos em {arquivo}"),
-        Err(e) => println!("\nNão consegui salvar {arquivo}: {e}"),
-    }
 }
 
 #[cfg(test)]
@@ -202,7 +210,7 @@ mod testes {
         let validacao: Vec<&Exemplo> = validacao.iter().collect();
         let mut treino: Vec<&Exemplo> = treino.iter().collect();
         let mut rede = Rede::aleatoria(1);
-        epoca(&mut rede, &mut Rede::zerada(), &mut treino, &mut rng);
+        epoca(&mut rede, &mut Rede::zerada(), &mut Adam::novo(TAXA), &mut treino, &mut rng);
         let m = medir(&rede, &validacao);
         assert!(m.acerto > 0.9, "acerto {}", m.acerto);
     }
