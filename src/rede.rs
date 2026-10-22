@@ -344,7 +344,94 @@ impl Rede {
         v
     }
 
+    fn parametros(&self) -> Vec<&Vec<f32>> {
+        let mut v = vec![&self.w1, &self.b1];
+        for d in &self.densas {
+            v.push(&d.w);
+            v.push(&d.b);
+        }
+        v
+    }
+
+    // Um passo de treino com um lote, usando todos os núcleos:
+    //   1) o lote é dividido entre as threads; cada uma acumula o
+    //      gradiente das suas posições num `g` próprio (gs[k]);
+    //   2) os parâmetros são divididos em faixas; cada thread soma os
+    //      gradientes parciais na sua faixa e aplica o Adam ali.
+    // A soma dos gradientes parciais é o gradiente do lote, e o Adam age
+    // número a número, então o resultado é o mesmo de `aplicar_adam`
+    // com o laço simples (a menos de arredondamento).
+    // Devolve o erro total do lote.
+    pub fn treinar_lote<T: Sync>(
+        &mut self,
+        gs: &mut [Rede],
+        adam: &mut Adam,
+        lote: &[T],
+        exemplo: impl Fn(&T) -> (&[usize], [f32; N_SAIDAS]) + Sync,
+    ) -> f64 {
+        let por_thread = lote.len().div_ceil(gs.len()).max(1);
+        let usados = lote.len().div_ceil(por_thread);
+        let rede = &*self;
+        let erro = std::thread::scope(|s| {
+            let exemplo = &exemplo;
+            let tarefas: Vec<_> = gs
+                .iter_mut()
+                .zip(lote.chunks(por_thread))
+                .map(|(g, parte)| {
+                    s.spawn(move || {
+                        g.zerar();
+                        parte
+                            .iter()
+                            .map(|e| {
+                                let (ligadas, alvo) = exemplo(e);
+                                rede.retropropagar(ligadas, alvo, g) as f64
+                            })
+                            .sum::<f64>()
+                    })
+                })
+                .collect();
+            tarefas.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+
+        adam.t += 1;
+        let (b1, b2) = (Adam::BETA1, Adam::BETA2);
+        let c1 = 1.0 - b1.powi(adam.t);
+        let c2 = 1.0 - b2.powi(adam.t);
+        let passo = adam.taxa * c2.sqrt() / c1;
+        let n = lote.len() as f32;
+        let parciais: Vec<Vec<&Vec<f32>>> = gs[..usados].iter().map(|g| g.parametros()).collect();
+        let threads = crate::paralelo::threads();
+        let tensores = self.parametros_mut().into_iter().zip(adam.m.parametros_mut()).zip(adam.v.parametros_mut());
+        std::thread::scope(|s| {
+            for (t, ((w, m), v)) in tensores.enumerate() {
+                let faixa = w.len().div_ceil(threads).max(4096);
+                let pedacos = w.chunks_mut(faixa).zip(m.chunks_mut(faixa)).zip(v.chunks_mut(faixa));
+                for (k, ((w, m), v)) in pedacos.enumerate() {
+                    let parciais = &parciais;
+                    s.spawn(move || {
+                        let inicio = k * faixa;
+                        for i in 0..w.len() {
+                            let gi = parciais.iter().map(|g| g[t][inicio + i]).sum::<f32>() / n;
+                            m[i] = b1 * m[i] + (1.0 - b1) * gi;
+                            v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;
+                            w[i] -= passo * m[i] / (v[i].sqrt() + 1e-8);
+                        }
+                    });
+                }
+            }
+        });
+        erro
+    }
+
+    // Um gradiente por thread, para o treinar_lote
+    pub fn gradientes() -> Vec<Rede> {
+        (0..crate::paralelo::threads()).map(|_| Rede::zerada()).collect()
+    }
+
     // Adam: um passo por lote, com o gradiente médio do lote em `g`.
+    // É a versão de referência, simples; o treino usa `treinar_lote`, que
+    // faz o mesmo em paralelo (o teste confere que os dois concordam).
+    #[cfg(test)]
     pub fn aplicar_adam(&mut self, g: &mut Rede, adam: &mut Adam, n: usize) {
         adam.t += 1;
         let (b1, b2) = (Adam::BETA1, Adam::BETA2);
@@ -587,6 +674,37 @@ mod testes {
         }
         let p = rede.probabilidades(&rede.acumulador(pos.board()), pos.turn());
         assert!(p[EMPATE] > 0.95, "{p:?}");
+    }
+
+    #[test]
+    fn lote_em_paralelo_igual_ao_laco_simples() {
+        // O treino paralelo (gradiente dividido entre threads + Adam por
+        // faixas) tem que dar os mesmos pesos que o laço simples.
+        let mut rng = Aleatorio(9);
+        let lote: Vec<(Vec<usize>, [f32; N_SAIDAS])> = (0..100)
+            .map(|k| {
+                let ligadas = (0..5).map(|_| ((rng.proximo() + 1.0) / 2.0 * 767.0) as usize).collect();
+                let mut alvo = [0.0; N_SAIDAS];
+                alvo[k % N_SAIDAS] = 1.0;
+                (ligadas, alvo)
+            })
+            .collect();
+        let mut simples = Rede::aleatoria(8);
+        let mut paralela = simples.clone();
+        let (mut adam_s, mut adam_p) = (Adam::novo(1e-3), Adam::novo(1e-3));
+        let mut gs = Rede::gradientes();
+        for _ in 0..3 {
+            let mut g = Rede::zerada();
+            let erro_s: f64 = lote.iter().map(|(l, a)| simples.retropropagar(l, *a, &mut g) as f64).sum();
+            simples.aplicar_adam(&mut g, &mut adam_s, lote.len());
+            let erro_p = paralela.treinar_lote(&mut gs, &mut adam_p, &lote, |(l, a)| (l, *a));
+            assert!((erro_s - erro_p).abs() < 1e-3 * erro_s.abs(), "{erro_s} {erro_p}");
+        }
+        for (a, b) in simples.parametros().into_iter().zip(paralela.parametros()) {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() < 1e-5, "{x} {y}");
+            }
+        }
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct Busca<'a, A: Avaliador> {
     nos: u64,
     // hashes das posições já vistas na partida e no ramo atual (repetição)
     historico: Vec<Zobrist64>,
+    // busca por tempo: passou do prazo, a busca desiste (e o resultado
+    // incompleto é jogado fora)
+    prazo: Option<std::time::Instant>,
+    abortou: bool,
 }
 
 fn hash(pos: &Chess) -> Zobrist64 {
@@ -68,7 +72,7 @@ impl<'a, A: Avaliador> Busca<'a, A> {
     // `historico_partida`: hashes das posições anteriores da partida,
     // para a busca enxergar empate por repetição.
     pub fn nova(avaliador: &'a A, historico_partida: Vec<Zobrist64>) -> Busca<'a, A> {
-        Busca { avaliador, nos: 0, historico: historico_partida }
+        Busca { avaliador, nos: 0, historico: historico_partida, prazo: None, abortou: false }
     }
 
     // posição seguinte e o estado do avaliador nela (ex.: acumulador da rede)
@@ -92,6 +96,9 @@ impl<'a, A: Avaliador> Busca<'a, A> {
             let (filho, est) = self.jogar(pos, &estado, m);
             let mut pv_filho = Vec::new();
             let nota = -self.negamax(&filho, &est, profundidade - 1, 1, -INFINITO, -alfa, &mut pv_filho);
+            if self.abortou {
+                break;
+            }
             if nota > alfa {
                 alfa = nota;
                 melhor = Some(m);
@@ -103,6 +110,62 @@ impl<'a, A: Avaliador> Busca<'a, A> {
         // sem lances: mate ou afogamento
         let nota = if melhor.is_some() { alfa } else if pos.is_check() { -MATE } else { 0 };
         Resultado { lance: melhor, nota, nos: self.nos, pv }
+    }
+
+    // Só a quiescência a partir da raiz: a avaliação "honesta" de uma
+    // posição, depois de resolvidas as trocas pendentes. A PV leva à folha.
+    pub fn quieta(&mut self, pos: &Chess) -> Resultado {
+        self.nos = 0;
+        let estado = self.avaliador.inicio(pos);
+        let mut pv = Vec::new();
+        let nota = self.quiescencia(pos, &estado, -INFINITO, INFINITO, MAX_QUIESCENCIA, &mut pv);
+        Resultado { lance: pv.first().copied(), nota, nos: self.nos, pv }
+    }
+
+    // Aprofundamento iterativo: profundidade 1, 2, 3... até acabar o
+    // tempo. Quando o prazo passa no meio de uma profundidade, a busca
+    // desiste dela e joga o lance da última profundidade completa. Assim
+    // o tempo usado é o tempo dado (importante para comparar métodos).
+    // A profundidade 1 sempre vai até o fim, para haver um lance.
+    pub fn por_tempo(&mut self, pos: &Chess, limite: std::time::Duration) -> Resultado {
+        let inicio = std::time::Instant::now();
+        let mut nos = 0;
+        let mut melhor = self.melhor_lance(pos, 1);
+        nos += melhor.nos;
+        self.prazo = Some(inicio + limite);
+        for prof in 2..=30 {
+            if melhor.lance.is_none() || melhor.nota.abs() > MATE - 1000 || inicio.elapsed() >= limite {
+                break;
+            }
+            let r = self.melhor_lance(pos, prof);
+            nos += r.nos;
+            if self.abortou {
+                break;
+            }
+            melhor = r;
+        }
+        self.prazo = None;
+        self.abortou = false;
+        melhor.nos = nos;
+        melhor
+    }
+
+    // a cada 1024 nós, confere o relógio
+    fn sem_tempo(&mut self) -> bool {
+        if !self.abortou && self.nos & 1023 == 0 && let Some(p) = self.prazo {
+            self.abortou = std::time::Instant::now() >= p;
+        }
+        self.abortou
+    }
+
+    // Para quem usa a busca por dentro (certeza.rs): um prazo, e se ele estourou.
+    pub fn com_prazo(mut self, prazo: Option<std::time::Instant>) -> Self {
+        self.prazo = prazo;
+        self
+    }
+
+    pub fn abortou(&self) -> bool {
+        self.abortou
     }
 
     fn eh_empate(&self, pos: &Chess) -> bool {
@@ -129,6 +192,9 @@ impl<'a, A: Avaliador> Busca<'a, A> {
         pv: &mut Vec<Move>,
     ) -> i32 {
         self.nos += 1;
+        if self.sem_tempo() {
+            return 0;
+        }
 
         if self.eh_empate(pos) {
             return 0;
@@ -147,6 +213,10 @@ impl<'a, A: Avaliador> Busca<'a, A> {
             let (filho, est) = self.jogar(pos, estado, m);
             let mut pv_filho = Vec::new();
             let nota = -self.negamax(&filho, &est, profundidade - 1, ply + 1, -beta, -alfa, &mut pv_filho);
+            if self.abortou {
+                self.historico.pop();
+                return 0;
+            }
             if nota >= beta {
                 self.historico.pop();
                 return beta; // corte beta: o adversário não deixaria chegar aqui
@@ -170,6 +240,9 @@ impl<'a, A: Avaliador> Busca<'a, A> {
         pv: &mut Vec<Move>,
     ) -> i32 {
         self.nos += 1;
+        if self.sem_tempo() {
+            return 0;
+        }
 
         // "Ficar parado": quem joga pode recusar todas as capturas, então
         // a nota estática é um piso. (Simplificação: em xeque isso não vale
@@ -293,6 +366,19 @@ mod testes {
         let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
         let r = Busca::nova(&rede, vec![]).melhor_lance(&pos, 2);
         assert_eq!(r.nota, minimax(&rede, &pos, 2, 0));
+    }
+
+    #[test]
+    fn por_tempo_usa_o_tempo_dado() {
+        // Com 200 ms, a busca tem que gastar perto de 200 ms (nem muito
+        // menos, nem muito mais) e devolver um lance legal.
+        let rede = Rede::aleatoria(13);
+        let pos = Chess::default();
+        let t = std::time::Instant::now();
+        let r = Busca::nova(&rede, vec![]).por_tempo(&pos, std::time::Duration::from_millis(200));
+        let gasto = t.elapsed().as_millis();
+        assert!((150..400).contains(&gasto), "{gasto} ms");
+        assert!(pos.is_legal(r.lance.unwrap()));
     }
 
     #[test]

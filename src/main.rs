@@ -17,6 +17,7 @@
 //                                             -> treina com tablebases Syzygy: finais de 3 a 5
 //                                                peças, 5000 posições por combinação, 10 épocas
 //   cargo run --release -- autojogo 100 64 auto.rede [inicial.rede] [pasta da syzygy]
+//   cargo run --release -- torneio auto.rede ab:1 ab:3 100 [pasta da syzygy]
 //                                             -> Etapa 3: 100 rodadas de 64 partidas da rede
 //                                                contra si mesma (TD-Leaf), salvando em auto.rede
 //
@@ -27,9 +28,12 @@
 mod autojogo;
 mod avaliacao;
 mod busca;
+mod certeza;
 mod finais;
+mod paralelo;
 mod rede;
 mod syzygy;
+mod torneio;
 mod treino;
 
 use avaliacao::{Avaliador, Material};
@@ -209,6 +213,16 @@ fn main() {
             let rodadas = arg(2).and_then(|e| e.parse().ok()).unwrap_or(100);
             let partidas = arg(3).and_then(|e| e.parse().ok()).unwrap_or(64);
             autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"), arg(6));
+        }
+        Some("torneio") => {
+            let (Some(a), Some(b)) = (arg(3), arg(4)) else {
+                eprintln!("uso: torneio <rede> <jogador A> <jogador B> [pares=100] [pasta da syzygy]");
+                eprintln!("jogadores: ab:3, ab:200ms, mat:3, cert:200ms, cert:200ms:0.3");
+                std::process::exit(1);
+            };
+            let (rede, nome) = escolher_rede(arg(2)).unwrap_or_else(|| (Rede::aleatoria(0x2545F4914F6CDD1D), "aleatória".into()));
+            let pares = arg(5).and_then(|e| e.parse().ok()).unwrap_or(100);
+            torneio::torneio(&rede, &nome, a, b, pares, arg(6));
         }
         Some("uci") => match escolher_rede(arg(2)) {
             Some((rede, nome)) => uci(&rede, &nome),

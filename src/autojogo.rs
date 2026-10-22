@@ -45,10 +45,10 @@ use shakmaty::{zobrist::Zobrist64, Chess, Color, EnPassantMode, Move, Outcome, P
 use shakmaty_syzygy::Tablebase;
 use std::time::Instant;
 
-type Dist = [f32; N_SAIDAS];
+pub type Dist = [f32; N_SAIDAS];
 
 // troca a perspectiva: V <-> D
-fn trocar(p: Dist) -> Dist {
+pub fn trocar(p: Dist) -> Dist {
     [p[DERROTA], p[EMPATE], p[VITORIA]]
 }
 
@@ -64,7 +64,7 @@ fn classe_certa(classe: usize) -> Dist {
     d
 }
 
-fn hash(pos: &Chess) -> Zobrist64 {
+pub fn hash(pos: &Chess) -> Zobrist64 {
     pos.zobrist_hash(EnPassantMode::Legal)
 }
 
@@ -115,7 +115,7 @@ pub struct Exemplo {
 }
 
 // Fim de partida: o valor para quem joga agora, se acabou
-fn fim(pos: &Chess, historico: &[Zobrist64], verdade: &Verdade, meios_lances: usize, cfg: &Config) -> Option<Valor> {
+pub fn fim(pos: &Chess, historico: &[Zobrist64], verdade: &Verdade, meios_lances: usize, cfg: &Config) -> Option<Valor> {
     if let Outcome::Known(r) = pos.outcome() {
         return Some(match r.winner() {
             None => Valor::Empate,
@@ -245,7 +245,7 @@ fn partida<A: Avaliador, B: Avaliador>(
     }
 }
 
-fn trocar_valor(v: Valor) -> Valor {
+pub fn trocar_valor(v: Valor) -> Valor {
     match v {
         Valor::Vitoria => Valor::Derrota,
         Valor::Empate => Valor::Empate,
@@ -253,7 +253,7 @@ fn trocar_valor(v: Valor) -> Valor {
     }
 }
 
-fn abertura(rng: &mut Aleatorio, meios_lances: usize) -> Vec<Move> {
+pub fn abertura(rng: &mut Aleatorio, meios_lances: usize) -> Vec<Move> {
     let mut pos = Chess::default();
     let mut lances = Vec::new();
     while lances.len() < meios_lances && !pos.legal_moves().is_empty() {
@@ -274,26 +274,15 @@ pub fn confronto<A: Avaliador + Sync, B: Avaliador + Sync>(
 ) -> f32 {
     let mut rng = Aleatorio(semente);
     let aberturas: Vec<Vec<Move>> = (0..pares).map(|_| abertura(&mut rng, 6)).collect();
-    let pontos: f32 = std::thread::scope(|s| {
-        let tarefas: Vec<_> = aberturas
-            .chunks(pares.div_ceil(threads()))
-            .map(|parte| {
-                s.spawn(move || {
-                    parte
-                        .iter()
-                        .map(|ab| partida(a, b, ab, profundidade, verdade) + (1.0 - partida(b, a, ab, profundidade, verdade)))
-                        .sum::<f32>()
-                })
-            })
-            .collect();
-        tarefas.into_iter().map(|t| t.join().unwrap()).sum()
-    });
+    let pontos: f32 = crate::paralelo::mapear(&aberturas, |ab| {
+        partida(a, b, ab, profundidade, verdade) + (1.0 - partida(b, a, ab, profundidade, verdade))
+    })
+    .into_iter()
+    .sum();
     pontos / (2 * pares) as f32
 }
 
-fn threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-}
+pub use crate::paralelo::threads;
 
 // ---------------------------------------------------------------------
 // O laço da Etapa 3
@@ -315,7 +304,7 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
         None => Rede::aleatoria(0x2545F4914F6CDD1D),
     };
     let original = rede.clone();
-    let mut g = Rede::zerada();
+    let mut gs = Rede::gradientes();
     let mut adam = Adam::novo(1e-3);
     let mut rng = Aleatorio(0xD1B54A32D192ED03);
     println!(
@@ -347,23 +336,8 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
     for rodada in 1..=rodadas {
         // 1) gera partidas em paralelo, cada thread com a sua semente
         let sementes: Vec<u64> = (0..partidas_por_rodada).map(|_| (rng.proximo().to_bits() as u64) << 32 | rodada as u64).collect();
-        let resultados: Vec<(Vec<Exemplo>, f32)> = std::thread::scope(|s| {
-            let rede = &rede;
-            let verdade = &verdade;
-            let cfg = &cfg;
-            let tarefas: Vec<_> = sementes
-                .chunks(partidas_por_rodada.div_ceil(threads()))
-                .map(|parte| {
-                    s.spawn(move || {
-                        parte
-                            .iter()
-                            .map(|&sem| partida_de_treino(rede, verdade, cfg, &mut Aleatorio(sem | 1)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            tarefas.into_iter().flat_map(|t| t.join().unwrap()).collect()
-        });
+        let resultados: Vec<(Vec<Exemplo>, f32)> =
+            crate::paralelo::mapear(&sementes, |&sem| partida_de_treino(&rede, &verdade, &cfg, &mut Aleatorio(sem | 1)));
         let (mut v, mut e, mut d) = (0, 0, 0);
         for (_, r) in &resultados {
             if *r > 0.0 { v += 1 } else if *r < 0.0 { d += 1 } else { e += 1 }
@@ -386,11 +360,7 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
         }
         let mut erro = 0.0f64;
         for lote in exemplos.chunks(256) {
-            g.zerar();
-            for ex in lote {
-                erro += rede.retropropagar(&ex.ligadas, ex.alvo, &mut g) as f64;
-            }
-            rede.aplicar_adam(&mut g, &mut adam, lote.len());
+            erro += rede.treinar_lote(&mut gs, &mut adam, lote, |ex| (&ex.ligadas, ex.alvo));
         }
         println!(
             "rodada {rodada:3}: {} partidas (brancas {v} / empates {e} / pretas {d}), {do_autojogo} posições + {} de finais, erro {:.4}",
