@@ -27,14 +27,22 @@
 //
 // Verdade exata quando existe:
 //   - a busca achou mate forçado -> alvo é vitória ou derrota certa;
-//   - a folha ou a partida chegou a um final de 3 peças -> gabarito da 2b.
+//   - a folha ou a partida chegou a um final de 3 peças (gabarito da 2b)
+//     ou, com a pasta da Syzygy, a um final de até 5 peças.
+//
+// Com a Syzygy, cada rodada também treina em posições de finais sorteadas,
+// tantas quanto as do autojogo. Sem isso a rede esquece os finais: o
+// autojogo quase não passa por eles, e os alvos do TD são misturas
+// "moles" das opiniões da própria rede, o que desmancha a certeza.
 // =====================================================================
 
 use crate::avaliacao::Avaliador;
 use crate::busca::{Busca, MATE};
 use crate::finais::{construir_todas, gabarito, Tabela, Valor};
+use crate::syzygy;
 use crate::rede::{entradas, Adam, Aleatorio, Rede, DERROTA, EMPATE, N_SAIDAS, VITORIA};
 use shakmaty::{zobrist::Zobrist64, Chess, Color, EnPassantMode, Move, Outcome, Position};
+use shakmaty_syzygy::Tablebase;
 use std::time::Instant;
 
 type Dist = [f32; N_SAIDAS];
@@ -50,8 +58,38 @@ fn certeza(v: Valor) -> Dist {
     d
 }
 
+fn classe_certa(classe: usize) -> Dist {
+    let mut d = [0.0; N_SAIDAS];
+    d[classe] = 1.0;
+    d
+}
+
 fn hash(pos: &Chess) -> Zobrist64 {
     pos.zobrist_hash(EnPassantMode::Legal)
+}
+
+// De onde vem a verdade exata dos finais: o gabarito de 3 peças e,
+// se houver, as tablebases Syzygy.
+pub struct Verdade {
+    tabelas: Vec<Tabela>,
+    syzygy: Option<Tablebase<Chess>>,
+}
+
+impl Verdade {
+    pub fn nova(syzygy: Option<Tablebase<Chess>>) -> Verdade {
+        Verdade { tabelas: construir_todas(), syzygy }
+    }
+
+    pub fn valor(&self, pos: &Chess) -> Option<Valor> {
+        if let Some(v) = gabarito(&self.tabelas, pos) {
+            return Some(v);
+        }
+        let tb = self.syzygy.as_ref()?;
+        if pos.board().occupied().count() > tb.max_pieces() {
+            return None;
+        }
+        syzygy::consultar(tb, pos)
+    }
 }
 
 pub struct Config {
@@ -77,7 +115,7 @@ pub struct Exemplo {
 }
 
 // Fim de partida: o valor para quem joga agora, se acabou
-fn fim(pos: &Chess, historico: &[Zobrist64], tabelas: &[Tabela], meios_lances: usize, cfg: &Config) -> Option<Valor> {
+fn fim(pos: &Chess, historico: &[Zobrist64], verdade: &Verdade, meios_lances: usize, cfg: &Config) -> Option<Valor> {
     if let Outcome::Known(r) = pos.outcome() {
         return Some(match r.winner() {
             None => Valor::Empate,
@@ -85,8 +123,8 @@ fn fim(pos: &Chess, historico: &[Zobrist64], tabelas: &[Tabela], meios_lances: u
             Some(_) => Valor::Derrota,
         });
     }
-    if let Some(v) = gabarito(tabelas, pos) {
-        return Some(v); // final de 3 peças: o gabarito decide a partida
+    if let Some(v) = verdade.valor(pos) {
+        return Some(v); // final com valor exato: a verdade decide a partida
     }
     let h = hash(pos);
     if historico.iter().filter(|&&x| x == h).count() >= 2 || pos.halfmoves() >= 100 || meios_lances >= cfg.max_meios_lances {
@@ -102,14 +140,14 @@ fn lance_aleatorio(pos: &Chess, rng: &mut Aleatorio) -> Move {
 }
 
 // Joga uma partida e devolve os exemplos de treino e o resultado (para as brancas)
-fn partida_de_treino(rede: &Rede, tabelas: &[Tabela], cfg: &Config, rng: &mut Aleatorio) -> (Vec<Exemplo>, f32) {
+fn partida_de_treino(rede: &Rede, verdade: &Verdade, cfg: &Config, rng: &mut Aleatorio) -> (Vec<Exemplo>, f32) {
     let mut pos = Chess::default();
     let mut historico: Vec<Zobrist64> = Vec::new();
     let mut passos: Vec<Passo> = Vec::new();
     let mut meios_lances = 0;
 
     let final_ = loop {
-        if let Some(v) = fim(&pos, &historico, tabelas, meios_lances, cfg) {
+        if let Some(v) = fim(&pos, &historico, verdade, meios_lances, cfg) {
             break (pos.turn(), v);
         }
         let m = if meios_lances < cfg.lances_aleatorios {
@@ -123,7 +161,7 @@ fn partida_de_treino(rede: &Rede, tabelas: &[Tabela], cfg: &Config, rng: &mut Al
             let inverte = r.pv.len() % 2 == 1;
             let (v, exato) = if r.nota.abs() > MATE - 1000 {
                 (certeza(if r.nota > 0 { Valor::Vitoria } else { Valor::Derrota }), true)
-            } else if let Some(g) = gabarito(tabelas, &folha) {
+            } else if let Some(g) = verdade.valor(&folha) {
                 let d = certeza(g);
                 (if inverte { trocar(d) } else { d }, true)
             } else {
@@ -179,14 +217,14 @@ fn partida<A: Avaliador, B: Avaliador>(
     pretas: &B,
     abertura: &[Move],
     profundidade: u32,
-    tabelas: &[Tabela],
+    verdade: &Verdade,
 ) -> f32 {
     let cfg = Config { max_meios_lances: 300, ..CONFIG_PADRAO };
     let mut pos = Chess::default();
     let mut historico = Vec::new();
     let mut n = 0;
     loop {
-        if let Some(v) = fim(&pos, &historico, tabelas, n, &cfg) {
+        if let Some(v) = fim(&pos, &historico, verdade, n, &cfg) {
             let para_brancas = if pos.turn().is_white() { v } else { trocar_valor(v) };
             return match para_brancas {
                 Valor::Vitoria => 1.0,
@@ -231,7 +269,7 @@ pub fn confronto<A: Avaliador + Sync, B: Avaliador + Sync>(
     b: &B,
     pares: usize,
     profundidade: u32,
-    tabelas: &[Tabela],
+    verdade: &Verdade,
     semente: u64,
 ) -> f32 {
     let mut rng = Aleatorio(semente);
@@ -243,7 +281,7 @@ pub fn confronto<A: Avaliador + Sync, B: Avaliador + Sync>(
                 s.spawn(move || {
                     parte
                         .iter()
-                        .map(|ab| partida(a, b, ab, profundidade, tabelas) + (1.0 - partida(b, a, ab, profundidade, tabelas)))
+                        .map(|ab| partida(a, b, ab, profundidade, verdade) + (1.0 - partida(b, a, ab, profundidade, verdade)))
                         .sum::<f32>()
                 })
             })
@@ -260,11 +298,18 @@ fn threads() -> usize {
 // ---------------------------------------------------------------------
 // O laço da Etapa 3
 // ---------------------------------------------------------------------
-pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>, arquivo: &str) {
+pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>, arquivo: &str, pasta_syzygy: Option<&str>) {
     use crate::avaliacao::Material;
     let cfg = CONFIG_PADRAO;
     let inicio = Instant::now();
-    let tabelas = construir_todas();
+    let verdade = Verdade::nova(pasta_syzygy.map(syzygy::abrir));
+    // Posições fixas de finais (100 por combinação) para medir, a cada 10
+    // rodadas, se a rede está esquecendo o que aprendeu com a Syzygy
+    let combos = verdade.syzygy.as_ref().map(|tb| syzygy::combinacoes(tb.max_pieces().min(5))).unwrap_or_default();
+    let finais_fixos: Vec<crate::treino::Exemplo> = match &verdade.syzygy {
+        Some(tb) => syzygy::amostra(tb, &combos, 100, 0x0123456789ABCDEF).0,
+        None => Vec::new(),
+    };
     let mut rede = match inicial {
         Some(a) => Rede::carregar(a).unwrap_or_else(|e| panic!("não consegui ler {a}: {e}")),
         None => Rede::aleatoria(0x2545F4914F6CDD1D),
@@ -281,10 +326,17 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
     );
     let pares = 50;
     let medir = |rede: &Rede, rotulo: &str| {
-        let contra_material = confronto(rede, &Material, pares, cfg.profundidade, &tabelas, 7);
-        let contra_original = confronto(rede, &original, pares, cfg.profundidade, &tabelas, 7);
+        let contra_material = confronto(rede, &Material, pares, cfg.profundidade, &verdade, 7);
+        let contra_original = confronto(rede, &original, pares, cfg.profundidade, &verdade, 7);
+        let finais = if finais_fixos.is_empty() {
+            String::new()
+        } else {
+            let fixos: Vec<&crate::treino::Exemplo> = finais_fixos.iter().collect();
+            let m = crate::treino::medir(rede, &fixos);
+            format!("   finais: acerto {:.1}%  P(certa) {:.3}", 100.0 * m.acerto, m.p_certa)
+        };
         println!(
-            "  [{rotulo}] pontos contra o material: {:.0}%   contra a rede inicial: {:.0}%   ({:.0} s)",
+            "  [{rotulo}] pontos contra o material: {:.0}%   contra a rede inicial: {:.0}%{finais}   ({:.0} s)",
             100.0 * contra_material,
             100.0 * contra_original,
             inicio.elapsed().as_secs_f64()
@@ -297,7 +349,7 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
         let sementes: Vec<u64> = (0..partidas_por_rodada).map(|_| (rng.proximo().to_bits() as u64) << 32 | rodada as u64).collect();
         let resultados: Vec<(Vec<Exemplo>, f32)> = std::thread::scope(|s| {
             let rede = &rede;
-            let tabelas = &tabelas;
+            let verdade = &verdade;
             let cfg = &cfg;
             let tarefas: Vec<_> = sementes
                 .chunks(partidas_por_rodada.div_ceil(threads()))
@@ -305,7 +357,7 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
                     s.spawn(move || {
                         parte
                             .iter()
-                            .map(|&sem| partida_de_treino(rede, tabelas, cfg, &mut Aleatorio(sem | 1)))
+                            .map(|&sem| partida_de_treino(rede, verdade, cfg, &mut Aleatorio(sem | 1)))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -317,6 +369,15 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
             if *r > 0.0 { v += 1 } else if *r < 0.0 { d += 1 } else { e += 1 }
         }
         let mut exemplos: Vec<Exemplo> = resultados.into_iter().flat_map(|(ex, _)| ex).collect();
+        let do_autojogo = exemplos.len();
+
+        // finais sorteados da Syzygy, tantos quanto as posições do autojogo
+        if let Some(tb) = &verdade.syzygy {
+            let por_combinacao = do_autojogo.div_ceil(combos.len());
+            let semente = (rodada as u64).wrapping_mul(0x9E3779B97F4A7C15);
+            let (finais, _) = syzygy::amostra(tb, &combos, por_combinacao, semente);
+            exemplos.extend(finais.into_iter().map(|f| Exemplo { ligadas: f.ligadas, alvo: classe_certa(f.classe) }));
+        }
 
         // 2) treina uma passada nos exemplos desta rodada, em lotes
         for i in (1..exemplos.len()).rev() {
@@ -332,9 +393,9 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
             rede.aplicar_adam(&mut g, &mut adam, lote.len());
         }
         println!(
-            "rodada {rodada:3}: {} partidas (brancas {v} / empates {e} / pretas {d}), {} posições, erro {:.4}",
+            "rodada {rodada:3}: {} partidas (brancas {v} / empates {e} / pretas {d}), {do_autojogo} posições + {} de finais, erro {:.4}",
             partidas_por_rodada,
-            exemplos.len(),
+            exemplos.len() - do_autojogo,
             erro / exemplos.len().max(1) as f64
         );
         if rodada % 10 == 0 || rodada == rodadas {
@@ -358,10 +419,10 @@ mod testes {
 
     #[test]
     fn partida_de_treino_gera_alvos_validos() {
-        let tabelas = construir_todas();
+        let verdade = Verdade::nova(None);
         let rede = Rede::aleatoria(3);
         let cfg = Config { profundidade: 1, lances_aleatorios: 4, lambda: 0.7, max_meios_lances: 60 };
-        let (exemplos, _) = partida_de_treino(&rede, &tabelas, &cfg, &mut Aleatorio(5));
+        let (exemplos, _) = partida_de_treino(&rede, &verdade, &cfg, &mut Aleatorio(5));
         assert!(!exemplos.is_empty());
         for e in &exemplos {
             // cada alvo é uma distribuição: soma 1, nada negativo
@@ -375,15 +436,37 @@ mod testes {
         // Com λ = 1 a opinião da rede some do alvo: só sobra o resultado da
         // partida (ou uma verdade exata do caminho), sempre uma classe certa.
         // Esta partida acaba em empate pelo limite de lances.
-        let tabelas = construir_todas();
+        let verdade = Verdade::nova(None);
         let rede = Rede::aleatoria(4);
         let cfg = Config { profundidade: 1, lances_aleatorios: 4, lambda: 1.0, max_meios_lances: 40 };
-        let (exemplos, resultado) = partida_de_treino(&rede, &tabelas, &cfg, &mut Aleatorio(9));
+        let (exemplos, resultado) = partida_de_treino(&rede, &verdade, &cfg, &mut Aleatorio(9));
         assert_eq!(resultado, 0.0);
         let empates = exemplos.iter().filter(|e| e.alvo[EMPATE] > 0.999).count();
         for e in &exemplos {
             assert!(e.alvo.iter().any(|&x| x > 0.999), "{:?}", e.alvo);
         }
         assert!(empates > exemplos.len() / 2);
+    }
+
+    // Só roda com tablebases em ./syzygy (ou na variável SYZYGY): a Syzygy
+    // concorda com o gabarito nos finais de 3 peças e responde finais de 5.
+    #[test]
+    fn verdade_com_syzygy() {
+        let dir = std::env::var("SYZYGY").unwrap_or_else(|_| "syzygy".into());
+        let mut tb = Tablebase::new();
+        if !std::path::Path::new(&dir).is_dir() || tb.add_directory(&dir).unwrap() == 0 {
+            eprintln!("(sem tablebases em {dir}: teste pulado)");
+            return;
+        }
+        let verdade = Verdade::nova(Some(tb));
+        let pos = |fen: &str| -> Chess {
+            fen.parse::<shakmaty::fen::Fen>().unwrap().into_position(shakmaty::CastlingMode::Standard).unwrap()
+        };
+        assert_eq!(verdade.valor(&pos("8/8/8/8/8/2k5/8/K6Q w - - 0 1")), Some(Valor::Vitoria));
+        assert_eq!(verdade.valor(&pos("7r/8/8/3k4/8/8/8/K5R1 w - - 0 1")), Some(Valor::Empate)); // KRvKR
+        assert_eq!(verdade.valor(&Chess::default()), None);
+        let cfg = Config { profundidade: 1, lances_aleatorios: 4, lambda: 0.7, max_meios_lances: 60 };
+        let (exemplos, _) = partida_de_treino(&Rede::aleatoria(3), &verdade, &cfg, &mut Aleatorio(5));
+        assert!(exemplos.iter().all(|e| (e.alvo.iter().sum::<f32>() - 1.0).abs() < 1e-4));
     }
 }

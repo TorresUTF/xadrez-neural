@@ -12,7 +12,7 @@ cargo run --release -- jogar 4 x.rede   # idem, com pesos lidos de um arquivo
 cargo run --release -- uci rede         # protocolo UCI, para GUIs e torneios
 cargo run --release -- finais 20 finais.rede   # Etapa 2b: treina nos finais de 3 peças
 cargo run --release -- syzygy syzygy 5 20000 10 syzygy.rede   # finais de 3 a 5 peças com tablebases Syzygy
-cargo run --release -- autojogo 200 64 auto.rede syzygy.rede  # Etapa 3: autojogo com TD-Leaf
+cargo run --release -- autojogo 200 64 auto.rede syzygy.rede syzygy  # Etapa 3: autojogo com TD-Leaf, finais pela Syzygy
 ```
 
 Para usar as tablebases: rode `powershell -ExecutionPolicy Bypass -File baixar_syzygy.ps1`, que baixa os arquivos `.rtbw` de até 5 peças para a pasta `syzygy`, e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).

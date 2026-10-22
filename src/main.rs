@@ -16,7 +16,7 @@
 //   cargo run --release -- syzygy pasta 5 5000 10 syzygy.rede [inicial.rede]
 //                                             -> treina com tablebases Syzygy: finais de 3 a 5
 //                                                peças, 5000 posições por combinação, 10 épocas
-//   cargo run --release -- autojogo 100 64 auto.rede [inicial.rede]
+//   cargo run --release -- autojogo 100 64 auto.rede [inicial.rede] [pasta da syzygy]
 //                                             -> Etapa 3: 100 rodadas de 64 partidas da rede
 //                                                contra si mesma (TD-Leaf), salvando em auto.rede
 //
@@ -208,7 +208,7 @@ fn main() {
         Some("autojogo") => {
             let rodadas = arg(2).and_then(|e| e.parse().ok()).unwrap_or(100);
             let partidas = arg(3).and_then(|e| e.parse().ok()).unwrap_or(64);
-            autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"));
+            autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"), arg(6));
         }
         Some("uci") => match escolher_rede(arg(2)) {
             Some((rede, nome)) => uci(&rede, &nome),

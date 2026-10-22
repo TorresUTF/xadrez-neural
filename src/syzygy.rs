@@ -144,12 +144,11 @@ pub fn abrir(diretorio: &str) -> Tablebase<Chess> {
     tabelas
 }
 
-// Gera `por_combinacao` exemplos de cada combinação de 3 a `max` peças,
-// em paralelo. O grupo (`final_`) de cada exemplo é o número de peças.
-pub fn gerar_exemplos(tabelas: &Tablebase<Chess>, max: usize, por_combinacao: usize) -> Vec<Exemplo> {
-    let combos = combinacoes(max);
+// Sorteia `por_combinacao` exemplos de cada combinação, em paralelo. O
+// grupo (`final_`) de cada exemplo é o número de peças. Devolve também os
+// nomes das combinações sem tabela no diretório.
+pub fn amostra(tabelas: &Tablebase<Chess>, combos: &[Material], por_combinacao: usize, semente: u64) -> (Vec<Exemplo>, Vec<String>) {
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    println!("{} combinações de material, {por_combinacao} posições de cada, {threads} threads", combos.len());
     let faltando = std::sync::Mutex::new(Vec::new());
     let exemplos: Vec<Exemplo> = std::thread::scope(|s| {
         let tarefas: Vec<_> = combos
@@ -158,7 +157,7 @@ pub fn gerar_exemplos(tabelas: &Tablebase<Chess>, max: usize, por_combinacao: us
             .map(|(t, parte)| {
                 let faltando = &faltando;
                 s.spawn(move || {
-                    let mut rng = Aleatorio(0x9E3779B97F4A7C15 ^ ((t as u64 + 1) << 32));
+                    let mut rng = Aleatorio(semente ^ ((t as u64 + 1) << 32));
                     let mut v = Vec::new();
                     for m in parte {
                         let mut feitos = 0;
@@ -184,7 +183,14 @@ pub fn gerar_exemplos(tabelas: &Tablebase<Chess>, max: usize, por_combinacao: us
             .collect();
         tarefas.into_iter().flat_map(|t| t.join().unwrap()).collect()
     });
-    let f = faltando.into_inner().unwrap();
+    (exemplos, faltando.into_inner().unwrap())
+}
+
+pub fn gerar_exemplos(tabelas: &Tablebase<Chess>, max: usize, por_combinacao: usize) -> Vec<Exemplo> {
+    let combos = combinacoes(max);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    println!("{} combinações de material, {por_combinacao} posições de cada, {threads} threads", combos.len());
+    let (exemplos, f) = amostra(tabelas, &combos, por_combinacao, 0x9E3779B97F4A7C15);
     if !f.is_empty() {
         println!("Aviso: {} combinações sem tabela no diretório ficaram de fora: {}", f.len(), f.join(", "));
     }
