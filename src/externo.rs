@@ -21,13 +21,27 @@
 //
 // Cada thread do torneio abre o seu próprio processo do motor e o usa
 // em todas as partidas que joga.
+//
+// Se o motor não responde em PRAZO (ou fecha), paramos com uma mensagem
+// que mostra as últimas linhas que ele escreveu, inclusive os erros
+// (stderr): sem isso, um lc0 que não acha a GPU ou o arquivo de pesos
+// deixa o torneio parado para sempre, sem dizer nada.
 // =====================================================================
 
 use shakmaty::{uci::UciMove, CastlingMode, Chess, Move};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+// Quanto esperar por uma resposta. O primeiro "readyok" do lc0 inclui
+// carregar os pesos e iniciar a GPU, o que pode levar alguns segundos.
+const PRAZO: Duration = Duration::from_secs(60);
+const LINHAS_GUARDADAS: usize = 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Externo {
@@ -57,9 +71,33 @@ pub fn ler(texto: &str) -> Option<Externo> {
 }
 
 struct Motor {
+    nome: String,
     filho: Child,
     entrada: ChildStdin,
-    saida: BufReader<ChildStdout>,
+    linhas: Receiver<String>,            // a saída padrão, linha a linha
+    recentes: Arc<Mutex<VecDeque<String>>>, // últimas linhas (saída e erros)
+}
+
+// Lê `fonte` numa thread própria, guardando as últimas linhas em
+// `recentes` e mandando cada uma por `canal` (se houver)
+fn ler_em_segundo_plano(fonte: impl Read + Send + 'static, rotulo: &'static str, recentes: Arc<Mutex<VecDeque<String>>>, canal: Option<mpsc::Sender<String>>) {
+    std::thread::spawn(move || {
+        for linha in BufReader::new(fonte).lines() {
+            let Ok(linha) = linha else { break };
+            {
+                let mut r = recentes.lock().unwrap();
+                if r.len() == LINHAS_GUARDADAS {
+                    r.pop_front();
+                }
+                r.push_back(format!("{rotulo}{linha}"));
+            }
+            if let Some(c) = &canal
+                && c.send(linha).is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 impl Motor {
@@ -68,12 +106,15 @@ impl Motor {
             .args(&cfg.comando[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("não consegui abrir o motor \"{}\": {e}", cfg.comando[0]));
         let entrada = filho.stdin.take().unwrap();
-        let saida = BufReader::new(filho.stdout.take().unwrap());
-        let mut m = Motor { filho, entrada, saida };
+        let recentes = Arc::new(Mutex::new(VecDeque::new()));
+        let (envia, linhas) = mpsc::channel();
+        ler_em_segundo_plano(filho.stdout.take().unwrap(), "", recentes.clone(), Some(envia));
+        ler_em_segundo_plano(filho.stderr.take().unwrap(), "[erro] ", recentes.clone(), None);
+        let mut m = Motor { nome: cfg.comando.join(" "), filho, entrada, linhas, recentes };
         m.enviar("uci");
         m.esperar("uciok");
         for (chave, valor) in &cfg.opcoes {
@@ -85,22 +126,39 @@ impl Motor {
     }
 
     fn enviar(&mut self, linha: &str) {
-        writeln!(self.entrada, "{linha}").and_then(|_| self.entrada.flush()).expect("o motor externo fechou");
+        if writeln!(self.entrada, "{linha}").and_then(|_| self.entrada.flush()).is_err() {
+            self.falhar(&format!("fechou antes de receber \"{linha}\""));
+        }
     }
 
     // lê linhas até uma que comece com `prefixo`, e devolve essa linha
     fn esperar(&mut self, prefixo: &str) -> String {
-        let mut linha = String::new();
         loop {
-            linha.clear();
-            let lidos = self.saida.read_line(&mut linha).expect("erro lendo o motor externo");
-            if lidos == 0 {
-                panic!("o motor externo fechou antes de responder \"{prefixo}\"");
-            }
-            if linha.trim_start().starts_with(prefixo) {
-                return linha.trim().to_string();
+            match self.linhas.recv_timeout(PRAZO) {
+                Ok(linha) if linha.trim_start().starts_with(prefixo) => return linha.trim().to_string(),
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => self.falhar(&format!("não respondeu \"{prefixo}\" em {} s", PRAZO.as_secs())),
+                Err(RecvTimeoutError::Disconnected) => self.falhar(&format!("fechou antes de responder \"{prefixo}\"")),
             }
         }
+    }
+
+    // Para o programa explicando o que houve, com as últimas linhas do motor
+    fn falhar(&mut self, motivo: &str) -> ! {
+        std::thread::sleep(Duration::from_millis(200)); // deixa chegar o resto do stderr
+        let recentes: Vec<String> = self.recentes.lock().unwrap().iter().cloned().collect();
+        let mut msg = format!("\nO motor externo \"{}\" {motivo}.", self.nome);
+        if recentes.is_empty() {
+            msg.push_str("\nEle não escreveu nada.");
+        } else {
+            msg.push_str("\nÚltimas linhas dele:");
+            for l in recentes {
+                msg.push_str(&format!("\n    {l}"));
+            }
+        }
+        eprintln!("{msg}");
+        let _ = self.filho.kill();
+        std::process::exit(1);
     }
 
     fn lance(&mut self, pos: &Chess, lances: &[Move], go: &str) -> Move {
