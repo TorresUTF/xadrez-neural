@@ -58,8 +58,12 @@ impl Avaliador for Rede {
         let nota = ((p[VITORIA] - p[DERROTA]) * ESCALA_REDE).round() as i32;
         // Posição decidida e rede com coluna de progresso: a nota passa a
         // medir QUÃO PERTO está o fim, como as notas de mate da busca.
+        // Só nos finais (a rosa aprendeu com finais de até 5 peças; no
+        // meio-jogo a resposta dela é chute) e só calculada quando vai ser
+        // usada (ela custa quase uma coluna inteira a mais).
         let decidida = p[VITORIA].max(p[DERROTA]) > LIMIAR_DECIDIDA;
-        match self.progresso(acc, pos.turn()).filter(|_| decidida) {
+        let final_ = pos.board().occupied().count() <= MAX_PECAS_PROGRESSO;
+        match (decidida && final_).then(|| self.progresso(acc, pos.turn())).flatten() {
             Some(prog) => {
                 let meios_lances = (prog * 100.0).clamp(0.0, MAX_MEIOS_LANCES);
                 let nota = NOTA_DECIDIDA - (meios_lances * NOTA_POR_MEIO_LANCE).round() as i32;
@@ -80,6 +84,9 @@ impl Avaliador for Rede {
 // Ganhar 1 meio-lance (4 pontos) pesa mais que o ruído de P_V entre 0,95
 // e 1 dentro do grupo ganho, que é justamente o que a rede V/E/D não
 // distingue. As notas de mate da busca (perto de 1 000 000) continuam acima.
+// Peças no tabuleiro (reis incluídos) até onde a rosa é usada: as que ela
+// viu no treino (Syzygy de 3 a 5 peças) e uma a mais.
+const MAX_PECAS_PROGRESSO: usize = 6;
 const LIMIAR_DECIDIDA: f32 = 0.95;
 const NOTA_DECIDIDA: i32 = 1500;
 const NOTA_POR_MEIO_LANCE: f32 = 4.0;
