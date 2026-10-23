@@ -70,6 +70,11 @@ pub struct Tabela {
     // índice = ((rei_branco * 64 + rei_preto) * 64 + peca) * 2 + vez
     // None = posição ilegal
     pub valores: Vec<Option<Valor>>,
+    // meios-lances até a partida se decidir com jogo perfeito: a rodada em
+    // que a posição foi resolvida (0 = mate ou afogamento já no tabuleiro).
+    // No KQK e no KRK é a distância até o mate; no KPK, até o mate ou a
+    // promoção. Empates: 0.
+    pub distancias: Vec<u16>,
     pub rodadas: usize,
 }
 
@@ -115,6 +120,7 @@ impl Tabela {
     // `outras`: tabelas já prontas, para as promoções do KPK
     pub fn construir(peca: Role, outras: &[&Tabela]) -> Tabela {
         let mut valores: Vec<Option<Valor>> = vec![None; N_POSICOES];
+        let mut distancias = vec![0u16; N_POSICOES];
         let mut legal = vec![false; N_POSICOES];
         let mut destinos: Vec<Vec<Destino>> = vec![Vec::new(); N_POSICOES];
 
@@ -185,6 +191,7 @@ impl Tabela {
             }
             for (i, v) in novos {
                 valores[i] = Some(v);
+                distancias[i] = rodadas as u16;
             }
         }
 
@@ -194,7 +201,7 @@ impl Tabela {
                 valores[i] = Some(Valor::Empate);
             }
         }
-        Tabela { peca, valores, rodadas }
+        Tabela { peca, valores, distancias, rodadas }
     }
 
     pub fn consultar(&self, pos: &Chess) -> Option<Valor> {
@@ -207,6 +214,22 @@ impl Tabela {
             .iter()
             .enumerate()
             .filter_map(move |(i, v)| Some((posicao(self.peca, i)?, (*v)?)))
+    }
+
+    // Posições decididas (vitória ou derrota) com a distância até o fim
+    pub fn exemplos_com_distancia(&self) -> impl Iterator<Item = (Chess, Valor, u16)> + '_ {
+        self.exemplos_indexados().filter(|(_, _, v)| *v != Valor::Empate).map(move |(i, pos, v)| (pos, v, self.distancias[i]))
+    }
+
+    fn exemplos_indexados(&self) -> impl Iterator<Item = (usize, Chess, Valor)> + '_ {
+        self.valores
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, v)| Some((i, posicao(self.peca, i)?, (*v)?)))
+    }
+
+    pub fn distancia(&self, pos: &Chess) -> Option<u16> {
+        Some(self.distancias[indice_de(pos, self.peca)?])
     }
 
     // (vitórias, empates, derrotas) para quem joga
@@ -238,6 +261,20 @@ pub fn gabarito(tabelas: &[Tabela], pos: &Chess) -> Option<Valor> {
     setup.mirror();
     let espelhada = Chess::from_setup(setup, CastlingMode::Standard).ok()?;
     tabelas.iter().find_map(|t| t.consultar(&espelhada))
+}
+
+// Valor e distância até o fim (meios-lances), como `gabarito`, para as
+// posições de 3 peças cobertas pelas `tabelas`
+pub fn gabarito_com_distancia(tabelas: &[Tabela], pos: &Chess) -> Option<(Valor, u16)> {
+    let consultar = |p: &Chess| tabelas.iter().find_map(|t| Some((t.consultar(p)?, t.distancia(p)?)));
+    if pos.board().occupied().count() != 3 {
+        return None;
+    }
+    consultar(pos).or_else(|| {
+        let mut setup = pos.to_setup(shakmaty::EnPassantMode::Legal);
+        setup.mirror();
+        consultar(&Chess::from_setup(setup, CastlingMode::Standard).ok()?)
+    })
 }
 
 // As três tabelas, na ordem certa (KPK precisa das outras duas)
@@ -284,6 +321,35 @@ mod testes {
         // As rodadas param uma depois da última mudança.
         assert_eq!(tabelas()[0].rodadas, 20 + 1);
         assert_eq!(tabelas()[1].rodadas, 32 + 1);
+    }
+
+    #[test]
+    fn distancias_consistentes() {
+        // Quem ganha em d tem um lance para uma derrota em d - 1; quem perde
+        // em d só tem lances para vitórias, e a mais longa é em d - 1.
+        let t = &tabelas()[0];
+        assert_eq!(t.distancias.iter().max(), Some(&20));
+        let mate_em_1: Chess = "6k1/8/6K1/8/8/8/8/Q7 w - - 0 1".parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
+        assert_eq!(t.distancia(&mate_em_1), Some(1));
+        for (pos, v, d) in t.exemplos_com_distancia().step_by(97) {
+            let filhos: Vec<(Valor, u16)> = pos
+                .legal_moves()
+                .into_iter()
+                .map(|m| {
+                    let f = pos.clone().play(m).unwrap();
+                    (t.consultar(&f).unwrap_or(Valor::Empate), t.distancia(&f).unwrap_or(0))
+                })
+                .collect();
+            match v {
+                Valor::Vitoria => assert!(filhos.contains(&(Valor::Derrota, d - 1)), "{d}"),
+                _ => {
+                    if d > 0 {
+                        assert!(filhos.iter().all(|f| f.0 == Valor::Vitoria));
+                        assert_eq!(filhos.iter().map(|f| f.1).max(), Some(d - 1));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

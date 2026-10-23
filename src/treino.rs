@@ -38,7 +38,7 @@ pub fn exemplos(tabelas: &[Tabela]) -> Vec<Exemplo> {
     v
 }
 
-fn embaralhar<T>(v: &mut [T], rng: &mut Aleatorio) {
+pub fn embaralhar<T>(v: &mut [T], rng: &mut Aleatorio) {
     // Fisher-Yates
     for i in (1..v.len()).rev() {
         let j = ((rng.proximo() as f64 + 1.0) / 2.0 * (i + 1) as f64) as usize;

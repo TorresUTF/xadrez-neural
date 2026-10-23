@@ -55,9 +55,35 @@ impl Avaliador for Rede {
     }
     fn nota(&self, acc: &Acumulador, pos: &Chess) -> i32 {
         let p = self.probabilidades(acc, pos.turn());
-        ((p[VITORIA] - p[DERROTA]) * ESCALA_REDE).round() as i32
+        let nota = ((p[VITORIA] - p[DERROTA]) * ESCALA_REDE).round() as i32;
+        // Posição decidida e rede com coluna de progresso: a nota passa a
+        // medir QUÃO PERTO está o fim, como as notas de mate da busca.
+        let decidida = p[VITORIA].max(p[DERROTA]) > LIMIAR_DECIDIDA;
+        match self.progresso(acc, pos.turn()).filter(|_| decidida) {
+            Some(prog) => {
+                let meios_lances = (prog * 100.0).clamp(0.0, MAX_MEIOS_LANCES);
+                let nota = NOTA_DECIDIDA - (meios_lances * NOTA_POR_MEIO_LANCE).round() as i32;
+                if p[VITORIA] > p[DERROTA] { nota } else { -nota }
+            }
+            None => nota,
+        }
     }
 }
+
+// Com a coluna de progresso, uma posição com P_V > 95% (ou P_D) não vale
+// mais ~950: vale 1500 menos 4 por meio-lance que a rede estima faltar.
+// Assim
+//   - toda posição decidida fica acima de qualquer posição em dúvida
+//     (o mínimo, 1500 - 4·120 = 1020, passa de 950), e
+//   - entre duas posições ganhas a busca prefere a mais perto do fim; quem
+//     perde prefere a mais longe (a nota é a mesma com o sinal trocado).
+// Ganhar 1 meio-lance (4 pontos) pesa mais que o ruído de P_V entre 0,95
+// e 1 dentro do grupo ganho, que é justamente o que a rede V/E/D não
+// distingue. As notas de mate da busca (perto de 1 000 000) continuam acima.
+const LIMIAR_DECIDIDA: f32 = 0.95;
+const NOTA_DECIDIDA: i32 = 1500;
+const NOTA_POR_MEIO_LANCE: f32 = 4.0;
+const MAX_MEIOS_LANCES: f32 = 120.0;
 
 pub const VALOR_PEAO: i32 = 100;
 pub const VALOR_CAVALO: i32 = 320;

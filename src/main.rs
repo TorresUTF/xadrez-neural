@@ -23,6 +23,9 @@
 //   cargo run --release -- crescer auto3.rede crescida.rede
 //                                             -> rede crescida: auto3 vira a coluna azul e
 //                                                ganha uma coluna verde (ver rede.rs)
+//   cargo run --release -- progresso crescida.rede rosa.rede [pasta da syzygy]
+//                                             -> coluna de progresso ("quantos meios-lances até
+//                                                acabar"), ver progresso.rs
 //   cargo run --release -- torneio auto.rede ab:1 ab:3 100 [pasta da syzygy]
 //
 // Sem arquivo, "rede" usa pesos aleatórios (semente fixa): ainda não há
@@ -36,6 +39,7 @@ mod certeza;
 mod externo;
 mod finais;
 mod paralelo;
+mod progresso;
 mod rede;
 mod syzygy;
 mod torneio;
@@ -231,6 +235,14 @@ fn main() {
             };
             let opcoes = autojogo::Opcoes { taxa, congelar: opcao("congelar").is_some() };
             autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"), arg(6), opcoes);
+        }
+        Some("progresso") => {
+            let (Some(base), Some(saida)) = (arg(2), arg(3)) else {
+                eprintln!("uso: progresso <rede> <saída> [pasta syzygy] [posições por combinação=2000] [épocas=10]");
+                std::process::exit(1);
+            };
+            let num = |i: usize, padrao: usize| arg(i).and_then(|e| e.parse().ok()).unwrap_or(padrao);
+            progresso::treinar(base, saida, arg(4), num(5, 2000), num(6, 10));
         }
         Some("crescer") => {
             let (Some(base), Some(saida)) = (arg(2), arg(3)) else {
