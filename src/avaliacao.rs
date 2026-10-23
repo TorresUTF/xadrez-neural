@@ -55,22 +55,28 @@ impl Avaliador for Rede {
     }
     fn nota(&self, acc: &Acumulador, pos: &Chess) -> i32 {
         let p = self.probabilidades(acc, pos.turn());
-        let nota = ((p[VITORIA] - p[DERROTA]) * ESCALA_REDE).round() as i32;
-        // Posição decidida e rede com coluna de progresso: a nota passa a
-        // medir QUÃO PERTO está o fim, como as notas de mate da busca.
-        // Só nos finais (a rosa aprendeu com finais de até 5 peças; no
-        // meio-jogo a resposta dela é chute) e só calculada quando vai ser
-        // usada (ela custa quase uma coluna inteira a mais).
-        let decidida = p[VITORIA].max(p[DERROTA]) > LIMIAR_DECIDIDA;
-        let final_ = pos.board().occupied().count() <= MAX_PECAS_PROGRESSO;
-        match (decidida && final_).then(|| self.progresso(acc, pos.turn())).flatten() {
-            Some(prog) => {
-                let meios_lances = (prog * 100.0).clamp(0.0, MAX_MEIOS_LANCES);
-                let nota = NOTA_DECIDIDA - (meios_lances * NOTA_POR_MEIO_LANCE).round() as i32;
-                if p[VITORIA] > p[DERROTA] { nota } else { -nota }
-            }
-            None => nota,
+        nota_da_rede(p, pos.board().occupied().count(), || self.progresso(acc, pos.turn()))
+    }
+}
+
+// A nota a partir de (P_V, P_E, P_D), das peças no tabuleiro e da coluna de
+// progresso (pedida só se for usada). A busca em lote (lote.rs) usa a mesma conta.
+pub fn nota_da_rede(p: [f32; 3], pecas: usize, progresso: impl FnOnce() -> Option<f32>) -> i32 {
+    let nota = ((p[VITORIA] - p[DERROTA]) * ESCALA_REDE).round() as i32;
+    // Posição decidida e rede com coluna de progresso: a nota passa a
+    // medir QUÃO PERTO está o fim, como as notas de mate da busca.
+    // Só nos finais (a rosa aprendeu com finais de até 5 peças; no
+    // meio-jogo a resposta dela é chute) e só calculada quando vai ser
+    // usada (ela custa quase uma coluna inteira a mais).
+    let decidida = p[VITORIA].max(p[DERROTA]) > LIMIAR_DECIDIDA;
+    let final_ = pecas <= MAX_PECAS_PROGRESSO;
+    match (decidida && final_).then(progresso).flatten() {
+        Some(prog) => {
+            let meios_lances = (prog * 100.0).clamp(0.0, MAX_MEIOS_LANCES);
+            let nota = NOTA_DECIDIDA - (meios_lances * NOTA_POR_MEIO_LANCE).round() as i32;
+            if p[VITORIA] > p[DERROTA] { nota } else { -nota }
         }
+        None => nota,
     }
 }
 

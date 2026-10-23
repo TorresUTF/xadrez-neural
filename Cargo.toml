@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 shakmaty = "0.30.2"
 shakmaty-syzygy = "0.28.1"
+# Etapa 5 (opcional): avaliação em lote na GPU. Compile com --features gpu
+burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "flex"], optional = true }
+
+[features]
+gpu = ["dep:burn"]

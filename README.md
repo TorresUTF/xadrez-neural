@@ -22,7 +22,11 @@ cargo run --release -- autojogo 300 64 crescida2.rede crescida.rede syzygy --con
 cargo run --release -- autojogo 300 64 crescida3.rede crescida2.rede syzygy --taxa=0.0003 # depois, tudo junto com passo menor
 cargo run --release -- progresso crescida3.rede rosa.rede syzygy   # coluna de progresso: "quantos lances até acabar" (precisa das .rtbz: baixar_syzygy.ps1 -Dtz)
 cargo run --release -- progresso crescida3.rede rosa.rede          # idem, só com KQK e KRK (sem download)
+cargo run --release --features gpu -- medir rosa.rede               # Etapa 5: quanto custa a força bruta (árvore na CPU, rede na GPU)
+cargo run --release --features gpu -- torneio rosa.rede gpu:200ms ab:200ms 100 syzygy   # força bruta na GPU contra o alfa-beta
 ```
+
+A GPU é opcional: sem `--features gpu` o programa compila como antes (sem baixar a Burn). Com ela, a primeira compilação demora uns 10 minutos.
 
 Para usar as tablebases: rode `powershell -ExecutionPolicy Bypass -File baixar_syzygy.ps1`, que baixa os arquivos `.rtbw` de até 5 peças para a pasta `syzygy`, e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).
 
@@ -39,6 +43,8 @@ O `.cargo/config.toml` compila para o processador da máquina (`target-cpu=nativ
 - `src/certeza.rs`: busca guiada pela certeza: a árvore cresce onde a rede está em dúvida (V/E/D), e para onde ela tem certeza.
 - `src/progresso.rs`: treina a coluna de progresso com a distância até o mate (linhas da Syzygy, ou KQK/KRK) e compara partidas com e sem ela.
 - `src/torneio.rs`: torneio entre métodos de escolher o lance (`ab:3`, `ab:200ms`, `mat:3`, `cert:200ms`), com aberturas pareadas e diferença de Elo com margem de erro.
+- `src/lote.rs`: Etapa 5. Força bruta: a árvore inteira até a profundidade N (sem poda) mais as capturas, todas as posições avaliadas de uma vez, e o negamax no fim. Dá a mesma nota do alfa-beta.
+- `src/gpu.rs`: a mesma rede avaliando milhares de posições de uma vez na placa de vídeo (Burn + wgpu). Só com `--features gpu`.
 - `src/externo.rs`: conversa com outro motor pelo protocolo UCI (Etapa 4: o Maia rodando no lc0).
 - `src/paralelo.rs`: divide o trabalho entre as threads por uma fila, para nenhum núcleo ficar parado.
 - `src/autojogo.rs`: Etapa 3. Autojogo em paralelo com TD-Leaf(λ) em três classes, finais de 3 peças decididos pelo gabarito, e confrontos para medir (rede contra material, rede contra a inicial).
@@ -54,5 +60,5 @@ As regras do xadrez vêm da biblioteca [`shakmaty`](https://crates.io/crates/sha
 | 2 | Rede (hoje 768 → 384 → 96 → 32 → 3, softmax V/E/D) no lugar do material | Concluída |
 | 2b | Treino supervisionado em finais de 3 peças com gabarito exato (99,4% de acerto em posições nunca vistas) | Concluída |
 | 3 | Autojogo com TD-Leaf | Código pronto, falta treinar por mais tempo |
-| 4 | Medição contra a linha de base e a Maia-1100 | A fazer |
-| 5 | Política + MCTS, transformer (opcional) | A fazer |
+| 4 | Medição contra a linha de base e a Maia (1100: +279, 1500: +149, 1900: +65) | Concluída |
+| 5 | GPU: força bruta com avaliação em lote, depois rede maior | Em andamento |

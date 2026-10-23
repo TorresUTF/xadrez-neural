@@ -12,6 +12,13 @@
 //   cert:200ms:0.3   ... com bônus de incerteza 0,3 (padrão 0,5)
 //   "uci=<comando>;go=nodes 1"   um motor externo pelo UCI (externo.rs),
 //                    ex.: o Maia-1100 rodando no lc0 (Etapa 4)
+//   gpu:3       força bruta (lote.rs): todos os lances até a profundidade 3,
+//               capturas depois, tudo avaliado de uma vez na GPU
+//   gpu:200ms   ... aprofundando enquanto couber em ~200 ms
+//   gpu:200ms:q4    ... com no máximo 4 meios-lances de capturas (padrão 8)
+//   gpu:200ms:c3    ... seguindo até 3 capturas por nó (padrão 2)
+//   gpu:3:todas     ... todas as capturas (sem filtro: explode em posições táticas)
+//   lote:3      a mesma força bruta avaliando na CPU (para comparar)
 //   ab:200ms@auto3.rede   qualquer jogador com "@arquivo" usa essa rede
 //                    no lugar da rede do torneio (para comparar redes)
 //
@@ -34,6 +41,7 @@ use crate::avaliacao::Material;
 use crate::busca::Busca;
 use crate::certeza::{self, Busca2};
 use crate::finais::Valor;
+use crate::lote::AvaliadorLote;
 use crate::rede::{Aleatorio, Rede};
 use shakmaty::{zobrist::Zobrist64, Chess, Move, Position};
 use std::time::{Duration, Instant};
@@ -50,12 +58,14 @@ pub enum Metodo {
     Material(Limite),
     Certeza { tempo: Duration, bonus: f32 },
     Externo(crate::externo::Externo),
+    Lote { limite: Limite, gpu: bool, opcoes: crate::lote::Opcoes },
 }
 
 pub struct Jogador<'a> {
     pub nome: String,
     pub metodo: Metodo,
     pub rede: &'a Rede,
+    pub gpu: Option<Box<dyn AvaliadorLote>>, // a rede na GPU, para "gpu:..."
 }
 
 fn limite(texto: &str) -> Option<Limite> {
@@ -74,6 +84,21 @@ pub fn ler(texto: &str) -> Option<Metodo> {
     match partes.as_slice() {
         ["ab", l] => limite(l).map(Metodo::AlfaBeta),
         ["mat", l] => limite(l).map(Metodo::Material),
+        [nome @ ("gpu" | "lote"), l, extras @ ..] => {
+            let mut opcoes = crate::lote::OPCOES_PADRAO;
+            for e in extras {
+                if let Some(q) = e.strip_prefix('q') {
+                    opcoes.quiescencia = q.parse().ok()?;
+                } else if let Some(c) = e.strip_prefix('c') {
+                    opcoes.capturas = c.parse().ok()?;
+                } else if *e == "todas" {
+                    opcoes.todas_capturas = true;
+                } else {
+                    return None;
+                }
+            }
+            Some(Metodo::Lote { limite: limite(l)?, gpu: *nome == "gpu", opcoes })
+        }
         ["cert", t] | ["cert", t, _] => {
             let Some(Limite::Tempo(tempo)) = limite(t) else { return None };
             let bonus = match partes.get(2) {
@@ -94,6 +119,14 @@ impl Jogador<'_> {
             Metodo::Material(Limite::Profundidade(p)) => Busca::nova(&Material, historico.to_vec()).melhor_lance(pos, *p),
             Metodo::Material(Limite::Tempo(t)) => Busca::nova(&Material, historico.to_vec()).por_tempo(pos, *t),
             Metodo::Externo(e) => return crate::externo::lance(e, pos, lances),
+            Metodo::Lote { limite, opcoes, .. } => {
+                let avaliador: &dyn AvaliadorLote = self.gpu.as_deref().unwrap_or(self.rede);
+                let r = match limite {
+                    Limite::Profundidade(p) => crate::lote::melhor_lance(pos, historico, *p, avaliador, opcoes),
+                    Limite::Tempo(t) => crate::lote::por_tempo(pos, historico, *t, avaliador, opcoes),
+                };
+                return r.lance.unwrap();
+            }
             Metodo::Certeza { tempo, bonus } => {
                 let cfg = certeza::Config { tempo: *tempo, bonus: *bonus };
                 return Busca2::nova(self.rede, verdade).melhor_lance(pos, historico, &cfg).lance.unwrap();
@@ -181,7 +214,7 @@ pub fn jogar(a: &Jogador, b: &Jogador, pares: usize, verdade: &Verdade, semente:
 pub fn torneio(rede: &Rede, nome_rede: &str, texto_a: &str, texto_b: &str, pares: usize, pasta_syzygy: Option<&str>) {
     let ler_ou_sair = |t: &str| {
         ler(t).unwrap_or_else(|| {
-            eprintln!("Não entendi o jogador \"{t}\". Exemplos: ab:3, ab:200ms, mat:3, cert:200ms, cert:200ms:0.3, \"uci=lc0.exe --weights=maia-1100.pb.gz;go=nodes 1\"");
+            eprintln!("Não entendi o jogador \"{t}\". Exemplos: ab:3, ab:200ms, mat:3, gpu:3, gpu:200ms, lote:3, cert:200ms, cert:200ms:0.3, \"uci=lc0.exe --weights=maia-1100.pb.gz;go=nodes 1\"");
             std::process::exit(1);
         })
     };
@@ -200,8 +233,12 @@ pub fn torneio(rede: &Rede, nome_rede: &str, texto_a: &str, texto_b: &str, pares
     };
     let (metodo_a, rede_a) = separar(texto_a);
     let (metodo_b, rede_b) = separar(texto_b);
-    let a = Jogador { nome: texto_a.into(), metodo: ler_ou_sair(&metodo_a), rede: rede_a.as_ref().unwrap_or(rede) };
-    let b = Jogador { nome: texto_b.into(), metodo: ler_ou_sair(&metodo_b), rede: rede_b.as_ref().unwrap_or(rede) };
+    fn jogador<'r>(nome: &str, metodo: Metodo, rede: &'r Rede) -> Jogador<'r> {
+        let gpu = matches!(metodo, Metodo::Lote { gpu: true, .. }).then(|| crate::lote::avaliador_gpu(rede));
+        Jogador { nome: nome.into(), metodo, rede, gpu }
+    }
+    let a = jogador(texto_a, ler_ou_sair(&metodo_a), rede_a.as_ref().unwrap_or(rede));
+    let b = jogador(texto_b, ler_ou_sair(&metodo_b), rede_b.as_ref().unwrap_or(rede));
     let verdade = Verdade::nova(pasta_syzygy.map(crate::syzygy::abrir));
     println!("Torneio: {} contra {}, {} partidas ({} aberturas, cores trocadas), rede {nome_rede}, {} threads", a.nome, b.nome, 2 * pares, pares, threads());
     let inicio = Instant::now();
@@ -231,6 +268,11 @@ mod testes {
         assert!(matches!(ler("cert:100ms"), Some(Metodo::Certeza { bonus, .. }) if (bonus - 0.5).abs() < 1e-6));
         assert!(ler("cert:3").is_none()); // a busca da certeza só tem limite de tempo
         assert!(ler("ab:0").is_none());
+        let padrao = crate::lote::OPCOES_PADRAO;
+        assert!(matches!(ler("gpu:3"), Some(Metodo::Lote { limite: Limite::Profundidade(3), gpu: true, opcoes }) if opcoes == padrao));
+        assert!(matches!(ler("lote:200ms:q4:todas"), Some(Metodo::Lote { limite: Limite::Tempo(_), gpu: false, opcoes })
+            if opcoes.quiescencia == 4 && opcoes.todas_capturas));
+        assert!(ler("gpu:3:x").is_none());
         assert!(ler("xyz:3").is_none());
         assert!(matches!(ler("uci=lc0.exe --weights=maia.pb.gz;go=nodes 1"), Some(Metodo::Externo(e)) if e.go == "nodes 1"));
     }
@@ -247,8 +289,8 @@ mod testes {
         // Sanidade do torneio: material com profundidade 3 contra 1.
         let rede = Rede::aleatoria(1);
         let verdade = Verdade::nova(None);
-        let a = Jogador { nome: "mat:3".into(), metodo: ler("mat:3").unwrap(), rede: &rede };
-        let b = Jogador { nome: "mat:1".into(), metodo: ler("mat:1").unwrap(), rede: &rede };
+        let a = Jogador { nome: "mat:3".into(), metodo: ler("mat:3").unwrap(), rede: &rede, gpu: None };
+        let b = Jogador { nome: "mat:1".into(), metodo: ler("mat:1").unwrap(), rede: &rede, gpu: None };
         let p = jogar(&a, &b, 4, &verdade, 1);
         assert_eq!(p.pontos.len(), 8);
         assert!(p.fracao() > 0.5, "{}", p.fracao());
