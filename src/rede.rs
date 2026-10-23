@@ -2,11 +2,13 @@
 // REDE — a rede avaliadora, escrita à mão
 // =====================================================================
 //
-// Arquitetura:  768 entradas -> 384 -> 96 -> 32 (CReLU) -> 3 (softmax)
+// Arquitetura padrão:  768 entradas -> 384 -> 96 -> 32 (CReLU) -> 3 (softmax)
 //
-// Os tamanhos estão em NIVEIS, logo abaixo. Para experimentar outra
-// arquitetura, basta mudar essa lista (pesos salvos de uma arquitetura
-// não carregam em outra; o arquivo guarda os tamanhos e avisa).
+// Desde a "rede crescida" (mais abaixo), a rede é um acumulador seguido
+// de uma ou mais COLUNAS. Cada coluna lê um pedaço do acumulador, tem as
+// suas camadas densas e termina em 3 números; os 3 números de todas as
+// colunas são somados antes do softmax. A rede padrão tem uma coluna só.
+// O arquivo guarda a arquitetura, então qualquer uma salva carrega.
 //
 // Saída: (P_V, P_E, P_D) = probabilidades de vitória, empate e derrota
 // para QUEM JOGA, assumindo jogo perfeito. A avaliação de -1 a +1 é
@@ -38,6 +40,21 @@
 // ATIVAÇÃO: CReLU(z) = min(max(z, 0), 1)  ("ReLU com teto").
 // Barata, e o teto em 1 mantém os números pequenos. Derivada: 1 entre 0 e 1,
 // 0 fora. (Na Etapa 0 usamos tanh; a ideia de não linearidade é a mesma.)
+//
+// A REDE CRESCIDA (ideia do Gabriel): aproveitar uma rede treinada
+// ("azul") e dar a ela uma coluna nova ("verde") ao lado:
+//
+//      acumulador azul (384) ──────────────> 96 -> 32 -> 3 ─┐
+//                 │                                          + -> softmax
+//      acumulador verde (384) ─┴─ (768) ─> 64 -> 32 -> 3 ───┘
+//
+// A coluna verde lê os dois acumuladores (o azul já sabe muita coisa).
+// Os pesos da última camada verde começam em ZERO, então a soma começa
+// igual à saída da azul: a rede crescida nasce jogando exatamente como a
+// original, e o treino só pode melhorá-la a partir dali. (A mesma ideia
+// das "progressive networks" da DeepMind e das "zero convolutions" do
+// ControlNet.) No começo a azul fica CONGELADA (gradiente zero), para a
+// verde aprender o que falta sem estragar o que a azul já sabe.
 // =====================================================================
 
 use shakmaty::{Bitboard, Board, Color, Piece, Role, Square};
@@ -46,11 +63,14 @@ use std::io::{self, Read, Write};
 pub const N_ENTRADAS: usize = 768;
 pub const N_SAIDAS: usize = 3; // 0 = vitória, 1 = empate, 2 = derrota
 
-// Tamanho de cada nível depois da entrada: o 1º é o acumulador, o último a saída.
+// Arquitetura padrão: tamanho de cada nível depois da entrada; o 1º é o
+// acumulador, o último a saída.
 pub const NIVEIS: [usize; 4] = [384, 96, 32, N_SAIDAS];
-pub const N_OCULTA1: usize = NIVEIS[0];
-const N_NIVEIS: usize = NIVEIS.len();
-const LARGURA: usize = N_OCULTA1; // o nível mais largo (buffers fixos, sem alocação)
+// Camadas densas da coluna verde da rede crescida (depois vem a saída)
+pub const VERDE: [usize; 2] = [64, 32];
+// O acumulador mais largo aceito (buffers fixos, sem alocação na busca)
+pub const MAX_ACUMULADOR: usize = 768;
+const LARGURA: usize = MAX_ACUMULADOR; // nenhum nível é mais largo que isso
 
 pub const VITORIA: usize = 0;
 pub const EMPATE: usize = 1;
@@ -78,32 +98,50 @@ pub struct Densa {
     pub b: Vec<f32>,
 }
 
+impl Densa {
+    fn zerada(entradas: usize, saidas: usize) -> Densa {
+        Densa { entradas, saidas, w: vec![0.0; entradas * saidas], b: vec![0.0; saidas] }
+    }
+
+    // pesos uniformes em ±1/sqrt(entradas): mantém z na faixa útil da CReLU
+    fn sortear(&mut self, rng: &mut Aleatorio) {
+        let escala = 1.0 / (self.entradas as f32).sqrt();
+        self.w.iter_mut().for_each(|w| *w = rng.proximo() * escala);
+    }
+}
+
+// Uma coluna: lê h[inicio..fim] do acumulador e passa pelas `densas`;
+// a última densa dá os 3 números da saída (sem CReLU).
+#[derive(Clone)]
+pub struct Coluna {
+    pub inicio: usize,
+    pub fim: usize,
+    pub densas: Vec<Densa>,
+    pub congelada: bool, // só no treino: não muda (não vai para o arquivo)
+}
+
 // Os pesos.
-//   w1[i * N_OCULTA1 + j] = peso da entrada i para o neurônio j da 1ª camada
-//                           (guardado por COLUNA: a coluna da entrada i é contígua,
-//                            que é o que o acumulador soma e subtrai)
-//   densas[k]             = camada do nível k para o nível k+1
+//   w1[i * largura + j] = peso da entrada i para o neurônio j do acumulador
+//                         (guardado por COLUNA: a coluna da entrada i é contígua,
+//                          que é o que o acumulador soma e subtrai)
+//   colunas             = as colunas depois do acumulador
+//   congelado           = só no treino: os neurônios 0..congelado do
+//                         acumulador não mudam
 // A mesma struct guarda os GRADIENTES no treino (mesmo formato).
 #[derive(Clone)]
 pub struct Rede {
+    pub largura: usize,
     pub w1: Vec<f32>,
     pub b1: Vec<f32>,
-    pub densas: Vec<Densa>,
+    pub colunas: Vec<Coluna>,
+    pub congelado: usize,
 }
 
 #[derive(Clone)]
 pub struct Acumulador {
-    // z1 de cada perspectiva: [brancas, pretas]
-    pub z1: [[f32; N_OCULTA1]; 2],
-}
-
-// Tudo o que o passo para frente calcula e o passo para trás reutiliza.
-// z[n] = soma ponderada do nível n, h[n] = CReLU(z[n]); só os primeiros
-// NIVEIS[n] números de cada linha são usados.
-pub struct Ativacoes {
-    pub z: [[f32; LARGURA]; N_NIVEIS],
-    pub h: [[f32; LARGURA]; N_NIVEIS],
-    pub p: [f32; N_SAIDAS],
+    // z1 de cada perspectiva: [brancas, pretas]; só os primeiros
+    // `largura` números são usados
+    pub z1: [[f32; MAX_ACUMULADOR]; 2],
 }
 
 fn crelu(z: f32) -> f32 {
@@ -155,17 +193,47 @@ pub fn entradas(board: &Board, lado: Color) -> Vec<usize> {
     board.iter().map(|(sq, p)| entrada(lado, p, sq)).collect()
 }
 
+fn invalido(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
 impl Rede {
-    pub fn zerada() -> Rede {
-        let densas = (1..N_NIVEIS)
-            .map(|n| Densa {
-                entradas: NIVEIS[n - 1],
-                saidas: NIVEIS[n],
-                w: vec![0.0; NIVEIS[n - 1] * NIVEIS[n]],
-                b: vec![0.0; NIVEIS[n]],
+    // Rede de zeros com a arquitetura dada: largura do acumulador e, para
+    // cada coluna, (início, fim, tamanhos das densas, terminando em N_SAIDAS)
+    pub fn zerada(largura: usize, colunas: &[(usize, usize, Vec<usize>)]) -> Rede {
+        let colunas = colunas
+            .iter()
+            .map(|(inicio, fim, niveis)| {
+                let mut anterior = fim - inicio;
+                let densas = niveis
+                    .iter()
+                    .map(|&n| {
+                        let d = Densa::zerada(anterior, n);
+                        anterior = n;
+                        d
+                    })
+                    .collect();
+                Coluna { inicio: *inicio, fim: *fim, densas, congelada: false }
             })
             .collect();
-        Rede { w1: vec![0.0; N_ENTRADAS * N_OCULTA1], b1: vec![0.0; N_OCULTA1], densas }
+        Rede { largura, w1: vec![0.0; N_ENTRADAS * largura], b1: vec![0.0; largura], colunas, congelado: 0 }
+    }
+
+    // A arquitetura padrão (uma coluna, NIVEIS)
+    pub fn padrao() -> Rede {
+        Rede::zerada(NIVEIS[0], &[(0, NIVEIS[0], NIVEIS[1..].to_vec())])
+    }
+
+    // Uma rede de zeros com a mesma forma (para gradientes e para o Adam)
+    pub fn zerada_como(&self) -> Rede {
+        let mut r = self.clone();
+        r.zerar();
+        r
+    }
+
+    // A arquitetura (sem os pesos), no formato que `zerada` recebe
+    pub fn arquitetura(&self) -> Vec<(usize, usize, Vec<usize>)> {
+        self.colunas.iter().map(|c| (c.inicio, c.fim, c.densas.iter().map(|d| d.saidas).collect())).collect()
     }
 
     // Pesos aleatórios uniformes em ±1/sqrt(entradas ativas por neurônio).
@@ -173,25 +241,83 @@ impl Rede {
     // Isso mantém a soma z na faixa útil da CReLU logo de início.
     pub fn aleatoria(semente: u64) -> Rede {
         let mut rng = Aleatorio(semente);
-        let mut r = Rede::zerada();
+        let mut r = Rede::padrao();
         let escala1 = 1.0 / (32.0f32).sqrt();
         r.w1.iter_mut().for_each(|w| *w = rng.proximo() * escala1);
-        for d in &mut r.densas {
-            let escala = 1.0 / (d.entradas as f32).sqrt();
-            d.w.iter_mut().for_each(|w| *w = rng.proximo() * escala);
+        for d in r.colunas.iter_mut().flat_map(|c| &mut c.densas) {
+            d.sortear(&mut rng);
         }
         r
     }
 
+    // A rede crescida: esta rede vira a coluna azul, e nasce uma coluna
+    // verde com um acumulador novo da mesma largura. A verde lê os dois
+    // acumuladores e passa por VERDE e pela saída, que começa em zero:
+    // a rede crescida dá exatamente as mesmas probabilidades que esta.
+    pub fn crescer(&self, semente: u64) -> Rede {
+        let (velha, nova) = (self.largura, 2 * self.largura);
+        assert!(nova <= MAX_ACUMULADOR, "acumulador de {nova} passa do máximo ({MAX_ACUMULADOR})");
+        let mut arq = self.arquitetura();
+        arq.push((0, nova, VERDE.iter().copied().chain([N_SAIDAS]).collect()));
+        let mut r = Rede::zerada(nova, &arq);
+        let mut rng = Aleatorio(semente);
+        let escala1 = 1.0 / (32.0f32).sqrt();
+        for i in 0..N_ENTRADAS {
+            r.w1[i * nova..i * nova + velha].copy_from_slice(self.coluna(i));
+            r.w1[i * nova + velha..(i + 1) * nova].iter_mut().for_each(|w| *w = rng.proximo() * escala1);
+        }
+        r.b1[..velha].copy_from_slice(&self.b1);
+        for (c, original) in r.colunas.iter_mut().zip(&self.colunas) {
+            c.densas.clone_from(&original.densas);
+        }
+        let verde = r.colunas.last_mut().unwrap();
+        let n = verde.densas.len();
+        for d in &mut verde.densas[..n - 1] {
+            d.sortear(&mut rng);
+        }
+        r
+    }
+
+    // Congela tudo menos a última coluna e a parte do acumulador que só
+    // ela usa (na rede crescida: congela a azul, treina a verde).
+    // Devolve false se a rede tem uma coluna só (não há o que congelar).
+    pub fn congelar_antigas(&mut self) -> bool {
+        let n = self.colunas.len();
+        if n < 2 {
+            return false;
+        }
+        self.congelado = self.colunas[..n - 1].iter().map(|c| c.fim).max().unwrap();
+        self.colunas[..n - 1].iter_mut().for_each(|c| c.congelada = true);
+        true
+    }
+
     fn coluna(&self, i: usize) -> &[f32] {
-        &self.w1[i * N_OCULTA1..(i + 1) * N_OCULTA1]
+        &self.w1[i * self.largura..(i + 1) * self.largura]
+    }
+
+    // Quantas multiplicações por avaliação, fora o acumulador (que é
+    // incremental): o custo de verdade de avaliar uma posição na busca
+    pub fn custo(&self) -> usize {
+        self.colunas.iter().flat_map(|c| &c.densas).map(|d| d.w.len()).sum()
+    }
+
+    pub fn descricao(&self) -> String {
+        let colunas: Vec<String> = self
+            .colunas
+            .iter()
+            .map(|c| {
+                let niveis: Vec<String> = c.densas.iter().map(|d| d.saidas.to_string()).collect();
+                format!("[{}..{}] {} -> {}", c.inicio, c.fim, c.fim - c.inicio, niveis.join(" -> "))
+            })
+            .collect();
+        format!("768 -> {} | {}", self.largura, colunas.join(" + "))
     }
 
     // -----------------------------------------------------------------
     // ACUMULADOR
     // -----------------------------------------------------------------
     pub fn acumulador(&self, board: &Board) -> Acumulador {
-        let mut z1 = [[0.0; N_OCULTA1]; 2];
+        let mut z1 = [[0.0; MAX_ACUMULADOR]; 2];
         for lado in Color::ALL {
             z1[indice_cor(lado)] = self.z1_de(&entradas(board, lado));
         }
@@ -224,11 +350,12 @@ impl Rede {
     }
 
     // z1 calculado do zero a partir das entradas ligadas (sem acumulador)
-    fn z1_de(&self, ligadas: &[usize]) -> [f32; N_OCULTA1] {
-        let mut z1 = [0.0; N_OCULTA1];
-        z1.copy_from_slice(&self.b1);
+    fn z1_de(&self, ligadas: &[usize]) -> [f32; MAX_ACUMULADOR] {
+        let mut z1 = [0.0; MAX_ACUMULADOR];
+        let z = &mut z1[..self.largura];
+        z.copy_from_slice(&self.b1);
         for &i in ligadas {
-            for (zj, wj) in z1.iter_mut().zip(self.coluna(i)) {
+            for (zj, wj) in z.iter_mut().zip(self.coluna(i)) {
                 *zj += wj;
             }
         }
@@ -237,33 +364,47 @@ impl Rede {
 
     // -----------------------------------------------------------------
     // PASSO PARA FRENTE, a partir do z1 (o acumulador de quem joga)
-    //   h[0] = CReLU(z1)
-    //   z[n] = W_n · h[n-1] + b_n,  h[n] = CReLU(z[n])   (camadas ocultas)
-    //   p    = softmax(z[último])                        (saída)
+    //   h0   = CReLU(z1)
+    //   em cada coluna, a partir de h = h0[inicio..fim]:
+    //     z = W · h + b,  h = CReLU(z)     (camadas ocultas)
+    //   saída = soma, sobre as colunas, do z da última camada
+    //   p     = softmax(saída)
+    // Na busca isto roda milhões de vezes: só buffers fixos, sem alocação.
     // -----------------------------------------------------------------
-    pub fn para_frente(&self, z1: &[f32; N_OCULTA1]) -> Ativacoes {
-        let mut a = Ativacoes { z: [[0.0; LARGURA]; N_NIVEIS], h: [[0.0; LARGURA]; N_NIVEIS], p: [0.0; N_SAIDAS] };
-        a.z[0] = *z1;
-        a.h[0] = z1.map(crelu);
-        for (n, d) in self.densas.iter().enumerate().map(|(k, d)| (k + 1, d)) {
-            for k in 0..d.saidas {
-                let linha = &d.w[k * d.entradas..(k + 1) * d.entradas];
-                a.z[n][k] = d.b[k] + produto(linha, &a.h[n - 1][..d.entradas]);
-                a.h[n][k] = crelu(a.z[n][k]);
+    fn saida(&self, z1: &[f32; MAX_ACUMULADOR]) -> [f32; N_SAIDAS] {
+        let mut h0 = [0.0f32; MAX_ACUMULADOR];
+        for (h, z) in h0[..self.largura].iter_mut().zip(z1) {
+            *h = crelu(*z);
+        }
+        let mut soma = [0.0f32; N_SAIDAS];
+        let (mut a, mut b) = ([0.0f32; LARGURA], [0.0f32; LARGURA]);
+        for c in &self.colunas {
+            // `ent` é a entrada da camada, `sai` a saída; depois trocam de papel
+            let (mut ent, mut sai) = (&mut a, &mut b);
+            ent[..c.fim - c.inicio].copy_from_slice(&h0[c.inicio..c.fim]);
+            let ultima = c.densas.len() - 1;
+            for (n, d) in c.densas.iter().enumerate() {
+                for (k, (s, b)) in sai.iter_mut().zip(&d.b).enumerate() {
+                    let z = b + produto(&d.w[k * d.entradas..(k + 1) * d.entradas], &ent[..d.entradas]);
+                    *s = if n == ultima { z } else { crelu(z) };
+                }
+                std::mem::swap(&mut ent, &mut sai);
+            }
+            for (s, x) in soma.iter_mut().zip(ent.iter()) {
+                *s += x;
             }
         }
-        a.p = softmax(&a.z[N_NIVEIS - 1][..N_SAIDAS]);
-        a
+        soma
     }
 
     // (P_V, P_E, P_D) para quem joga
     pub fn probabilidades(&self, acc: &Acumulador, quem_joga: Color) -> [f32; N_SAIDAS] {
-        self.para_frente(&acc.z1[indice_cor(quem_joga)]).p
+        softmax(&self.saida(&acc.z1[indice_cor(quem_joga)]))
     }
 
     // (P_V, P_E, P_D) a partir das entradas ligadas, já do ponto de vista de quem joga
     pub fn probabilidades_de(&self, ligadas: &[usize]) -> [f32; N_SAIDAS] {
-        self.para_frente(&self.z1_de(ligadas)).p
+        softmax(&self.saida(&self.z1_de(ligadas)))
     }
 
     // -----------------------------------------------------------------
@@ -272,56 +413,95 @@ impl Rede {
     // alvo t = (t_V, t_E, t_D). Soma os gradientes em `g` e devolve o erro
     //      L = -soma_k t_k ln p_k        (entropia cruzada)
     // É a mesma regra da cadeia da Etapa 0, repetida camada a camada.
+    // Partes congeladas não recebem gradiente (e por isso não mudam).
     // -----------------------------------------------------------------
     // os índices k e j seguem as fórmulas, por isso laços com índice
     #[allow(clippy::needless_range_loop)]
     pub fn retropropagar(&self, ligadas: &[usize], alvo: [f32; N_SAIDAS], g: &mut Rede) -> f32 {
-        let a = self.para_frente(&self.z1_de(ligadas));
-        let erro = -(0..N_SAIDAS).map(|s| alvo[s] * a.p[s].max(1e-12).ln()).sum::<f32>();
+        // Passo para frente guardando os z de cada camada de cada coluna
+        let z0 = self.z1_de(ligadas);
+        let h0: Vec<f32> = z0[..self.largura].iter().map(|&z| crelu(z)).collect();
+        let mut soma = [0.0f32; N_SAIDAS];
+        let zs: Vec<Vec<Vec<f32>>> = self
+            .colunas
+            .iter()
+            .map(|c| {
+                let mut zs: Vec<Vec<f32>> = Vec::with_capacity(c.densas.len());
+                let mut h = h0[c.inicio..c.fim].to_vec();
+                for d in &c.densas {
+                    let z: Vec<f32> =
+                        (0..d.saidas).map(|k| d.b[k] + produto(&d.w[k * d.entradas..(k + 1) * d.entradas], &h)).collect();
+                    h = z.iter().map(|&x| crelu(x)).collect();
+                    zs.push(z);
+                }
+                for (s, x) in soma.iter_mut().zip(zs.last().unwrap()) {
+                    *s += x;
+                }
+                zs
+            })
+            .collect();
+        let p = softmax(&soma);
+        let erro = -(0..N_SAIDAS).map(|s| alvo[s] * p[s].max(1e-12).ln()).sum::<f32>();
 
         // 1) Saída: com softmax + entropia cruzada, dL/dz = p - t
-        //    (o mesmo cancelamento do y - t da Etapa 0)
-        let mut delta = [0.0f32; LARGURA];
-        for s in 0..N_SAIDAS {
-            delta[s] = a.p[s] - alvo[s];
-        }
+        //    (o mesmo cancelamento do y - t da Etapa 0). Como a saída é a
+        //    SOMA das colunas, cada coluna recebe esse mesmo erro.
+        let delta_saida: Vec<f32> = (0..N_SAIDAS).map(|s| p[s] - alvo[s]).collect();
+        let mut delta0 = vec![0.0f32; self.largura]; // erro no acumulador
 
-        // 2) De trás para frente, camada densa por camada densa:
+        // 2) Em cada coluna, de trás para frente, camada densa por camada densa:
         //      dL/dW_n[k][j] = delta_k · h[n-1]_j        (gradiente dos pesos)
         //      dL/db_n[k]    = delta_k
         //      delta_ant_j   = (soma_k W_n[k][j] · delta_k) · CReLU'(z[n-1]_j)
         //    O erro "volta" pelos mesmos pesos que o sinal usou para ir.
-        for n in (1..N_NIVEIS).rev() {
-            let d = &self.densas[n - 1];
-            let gd = &mut g.densas[n - 1];
-            let mut anterior = [0.0f32; LARGURA];
-            for k in 0..d.saidas {
-                let dk = delta[k];
-                if dk == 0.0 {
-                    continue; // neurônio desligado: não contribui
+        for ((c, zs), gc) in self.colunas.iter().zip(&zs).zip(&mut g.colunas) {
+            if c.congelada && c.fim <= self.congelado {
+                continue; // nada aqui nem atrás daqui muda
+            }
+            let mut delta = delta_saida.clone();
+            for n in (0..c.densas.len()).rev() {
+                let d = &c.densas[n];
+                let gd = &mut gc.densas[n];
+                // o z e o h do nível anterior (n = 0: o pedaço do acumulador)
+                let z_ant: &[f32] = if n == 0 { &z0[c.inicio..c.fim] } else { &zs[n - 1] };
+                let mut anterior = vec![0.0f32; d.entradas];
+                for k in 0..d.saidas {
+                    let dk = delta[k];
+                    if dk == 0.0 {
+                        continue; // neurônio desligado: não contribui
+                    }
+                    let linha_w = &d.w[k * d.entradas..(k + 1) * d.entradas];
+                    if !c.congelada {
+                        gd.b[k] += dk;
+                        let linha_g = &mut gd.w[k * d.entradas..(k + 1) * d.entradas];
+                        for j in 0..d.entradas {
+                            linha_g[j] += dk * crelu(z_ant[j]);
+                        }
+                    }
+                    for j in 0..d.entradas {
+                        anterior[j] += linha_w[j] * dk;
+                    }
                 }
-                gd.b[k] += dk;
-                let linha_g = &mut gd.w[k * d.entradas..(k + 1) * d.entradas];
-                let linha_w = &d.w[k * d.entradas..(k + 1) * d.entradas];
                 for j in 0..d.entradas {
-                    linha_g[j] += dk * a.h[n - 1][j];
-                    anterior[j] += linha_w[j] * dk;
+                    anterior[j] *= crelu_derivada(z_ant[j]);
                 }
+                delta = anterior;
             }
-            for j in 0..d.entradas {
-                anterior[j] *= crelu_derivada(a.z[n - 1][j]);
+            for (d0, dj) in delta0[c.inicio..c.fim].iter_mut().zip(&delta) {
+                *d0 += dj;
             }
-            delta = anterior;
         }
 
-        // 3) Agora delta é o erro na 1ª camada (o acumulador).
+        // 3) Agora delta0 é o erro no acumulador.
         //    dL/dW1[j][i] = delta_j · x_i, e x_i só vale 1 nas entradas
         //    ligadas: as outras ~736 colunas não recebem nada.
-        for (gb, dj) in g.b1.iter_mut().zip(&delta) {
+        let livres = self.congelado..self.largura;
+        for (gb, dj) in g.b1[livres.clone()].iter_mut().zip(&delta0[livres.clone()]) {
             *gb += dj;
         }
         for &i in ligadas {
-            for (gj, dj) in g.w1[i * N_OCULTA1..(i + 1) * N_OCULTA1].iter_mut().zip(&delta) {
+            let base = i * self.largura;
+            for (gj, dj) in g.w1[base + livres.start..base + livres.end].iter_mut().zip(&delta0[livres.clone()]) {
                 *gj += dj;
             }
         }
@@ -334,10 +514,11 @@ impl Rede {
         }
     }
 
-    // Todos os números da rede, na ordem: w1, b1, depois w e b de cada densa
+    // Todos os números da rede, na ordem: w1, b1, depois w e b de cada
+    // densa, coluna por coluna
     fn parametros_mut(&mut self) -> Vec<&mut Vec<f32>> {
         let mut v = vec![&mut self.w1, &mut self.b1];
-        for d in &mut self.densas {
+        for d in self.colunas.iter_mut().flat_map(|c| &mut c.densas) {
             v.push(&mut d.w);
             v.push(&mut d.b);
         }
@@ -346,7 +527,7 @@ impl Rede {
 
     fn parametros(&self) -> Vec<&Vec<f32>> {
         let mut v = vec![&self.w1, &self.b1];
-        for d in &self.densas {
+        for d in self.colunas.iter().flat_map(|c| &c.densas) {
             v.push(&d.w);
             v.push(&d.b);
         }
@@ -424,8 +605,8 @@ impl Rede {
     }
 
     // Um gradiente por thread, para o treinar_lote
-    pub fn gradientes() -> Vec<Rede> {
-        (0..crate::paralelo::threads()).map(|_| Rede::zerada()).collect()
+    pub fn gradientes(&self) -> Vec<Rede> {
+        (0..crate::paralelo::threads()).map(|_| self.zerada_como()).collect()
     }
 
     // Adam: um passo por lote, com o gradiente médio do lote em `g`.
@@ -452,24 +633,42 @@ impl Rede {
     }
 
     // -----------------------------------------------------------------
-    // Salvar e carregar: assinatura de 4 bytes, os tamanhos dos níveis
-    // (u32) e depois os números em sequência, f32 little-endian.
+    // Salvar e carregar. Formato "XNR3": assinatura de 4 bytes, depois
+    // (u32) a largura do acumulador, o número de colunas e, para cada
+    // coluna, início, fim, número de densas e o tamanho de cada uma; por
+    // fim os números em sequência, f32 little-endian.
+    // O formato antigo "XNR2" (só a arquitetura padrão) ainda carrega:
+    // os números estão na mesma ordem.
     // -----------------------------------------------------------------
-    const ASSINATURA: &'static [u8; 4] = b"XNR2";
+    const ASSINATURA: &'static [u8; 4] = b"XNR3";
+    const ASSINATURA_V2: &'static [u8; 4] = b"XNR2";
 
-    fn cabecalho() -> Vec<u8> {
+    fn cabecalho(&self) -> Vec<u8> {
+        let mut numeros = vec![self.largura, self.colunas.len()];
+        for (inicio, fim, niveis) in self.arquitetura() {
+            numeros.extend([inicio, fim, niveis.len()]);
+            numeros.extend(niveis);
+        }
         let mut c = Self::ASSINATURA.to_vec();
-        c.extend((N_NIVEIS as u32).to_le_bytes());
+        for n in numeros {
+            c.extend((n as u32).to_le_bytes());
+        }
+        c
+    }
+
+    fn cabecalho_v2() -> Vec<u8> {
+        let mut c = Self::ASSINATURA_V2.to_vec();
+        c.extend((NIVEIS.len() as u32).to_le_bytes());
         for n in NIVEIS {
             c.extend((n as u32).to_le_bytes());
         }
         c
     }
 
-    pub fn salvar(&mut self, arquivo: &str) -> io::Result<()> {
+    pub fn salvar(&self, arquivo: &str) -> io::Result<()> {
         let mut f = io::BufWriter::new(std::fs::File::create(arquivo)?);
-        f.write_all(&Self::cabecalho())?;
-        for v in self.parametros_mut() {
+        f.write_all(&self.cabecalho())?;
+        for v in self.parametros() {
             for x in v.iter() {
                 f.write_all(&x.to_le_bytes())?;
             }
@@ -477,22 +676,54 @@ impl Rede {
         Ok(())
     }
 
+    // Lê a arquitetura do cabeçalho XNR3; devolve a rede zerada e o tamanho do cabeçalho
+    fn ler_cabecalho(bytes: &[u8]) -> io::Result<(Rede, usize)> {
+        let mut pos = 4;
+        let mut ler = || -> io::Result<usize> {
+            let b = bytes.get(pos..pos + 4).ok_or_else(|| invalido("cabeçalho cortado".into()))?;
+            pos += 4;
+            Ok(u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        };
+        let largura = ler()?;
+        if largura == 0 || largura > MAX_ACUMULADOR {
+            return Err(invalido(format!("acumulador de {largura} (o máximo é {MAX_ACUMULADOR})")));
+        }
+        let n_colunas = ler()?;
+        if n_colunas == 0 || n_colunas > 16 {
+            return Err(invalido(format!("{n_colunas} colunas?")));
+        }
+        let mut arq = Vec::new();
+        for _ in 0..n_colunas {
+            let (inicio, fim, n) = (ler()?, ler()?, ler()?);
+            let niveis = (0..n).map(|_| ler()).collect::<io::Result<Vec<usize>>>()?;
+            let ok = inicio < fim
+                && fim <= largura
+                && niveis.last() == Some(&N_SAIDAS)
+                && niveis.iter().all(|&x| (1..=LARGURA).contains(&x));
+            if !ok {
+                return Err(invalido(format!("coluna inválida: {inicio}..{fim} {niveis:?}")));
+            }
+            arq.push((inicio, fim, niveis));
+        }
+        let tamanho = 4 + 4 * (2 + arq.iter().map(|(_, _, n)| 3 + n.len()).sum::<usize>());
+        Ok((Rede::zerada(largura, &arq), tamanho))
+    }
+
     pub fn carregar(arquivo: &str) -> io::Result<Rede> {
         let mut bytes = Vec::new();
         std::fs::File::open(arquivo)?.read_to_end(&mut bytes)?;
-        let cab = Self::cabecalho();
-        if !bytes.starts_with(&cab) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("arquivo de outra versão ou arquitetura (esperava níveis {NIVEIS:?})"),
-            ));
+        let (mut r, tamanho) = if bytes.starts_with(Self::ASSINATURA) {
+            Self::ler_cabecalho(&bytes)?
+        } else if bytes.starts_with(&Self::cabecalho_v2()) {
+            (Rede::padrao(), Self::cabecalho_v2().len())
+        } else {
+            return Err(invalido(format!("arquivo de outra versão ou arquitetura (formato XNR2 só com níveis {NIVEIS:?})")));
+        };
+        let total: usize = r.parametros().iter().map(|v| v.len()).sum();
+        if bytes.len() != tamanho + 4 * total {
+            return Err(invalido("arquivo de rede com tamanho errado".into()));
         }
-        let mut r = Rede::zerada();
-        let total: usize = r.parametros_mut().iter().map(|v| v.len()).sum();
-        if bytes.len() != cab.len() + 4 * total {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "arquivo de rede com tamanho errado"));
-        }
-        let mut numeros = bytes[cab.len()..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()));
+        let mut numeros = bytes[tamanho..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()));
         for v in r.parametros_mut() {
             v.iter_mut().for_each(|x| *x = numeros.next().unwrap());
         }
@@ -509,6 +740,8 @@ impl Rede {
 //      w <- w - taxa · m / sqrt(v)
 // Cada peso ganha o seu próprio tamanho de passo. É o otimizador padrão
 // de quase todo treino moderno, inclusive de LLMs.
+// (Um peso congelado tem gradiente sempre zero: m e v ficam em zero e o
+// passo m / (sqrt(v) + 1e-8) também; ele não se mexe.)
 // ---------------------------------------------------------------------
 pub struct Adam {
     pub taxa: f32,
@@ -521,8 +754,8 @@ impl Adam {
     const BETA1: f32 = 0.9;
     const BETA2: f32 = 0.999;
 
-    pub fn novo(taxa: f32) -> Adam {
-        Adam { taxa, m: Rede::zerada(), v: Rede::zerada(), t: 0 }
+    pub fn novo(taxa: f32, rede: &Rede) -> Adam {
+        Adam { taxa, m: rede.zerada_como(), v: rede.zerada_como(), t: 0 }
     }
 }
 
@@ -535,37 +768,53 @@ mod testes {
         fen.parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap()
     }
 
+    // Uma rede crescida com a saída verde já "treinada" (não nula), para
+    // os testes enxergarem a coluna verde
+    fn crescida_ativa(semente: u64) -> Rede {
+        let mut r = Rede::aleatoria(semente).crescer(semente + 1);
+        let mut rng = Aleatorio(semente + 2);
+        r.colunas.last_mut().unwrap().densas.last_mut().unwrap().sortear(&mut rng);
+        r
+    }
+
+    // A rede padrão e duas crescidas: os testes gerais valem para todas
+    fn redes(semente: u64) -> Vec<Rede> {
+        vec![Rede::aleatoria(semente), Rede::aleatoria(semente).crescer(semente + 1), crescida_ativa(semente)]
+    }
+
     #[test]
     fn probabilidades_somam_um() {
-        let rede = Rede::aleatoria(1);
-        let pos = Chess::default();
-        let p = rede.probabilidades(&rede.acumulador(pos.board()), pos.turn());
-        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(p.iter().all(|&x| x > 0.0));
+        for rede in redes(1) {
+            let pos = Chess::default();
+            let p = rede.probabilidades(&rede.acumulador(pos.board()), pos.turn());
+            assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+            assert!(p.iter().all(|&x| x > 0.0));
+        }
     }
 
     #[test]
     fn incremental_igual_a_recalcular() {
         // Joga 40 lances "aleatórios" (sempre o k-ésimo da lista) atualizando o
         // acumulador lance a lance, e compara com o recálculo do zero.
-        let rede = Rede::aleatoria(2);
-        let mut pos = Chess::default();
-        let mut acc = rede.acumulador(pos.board());
-        let mut rng = Aleatorio(99);
-        for _ in 0..40 {
-            let lances = pos.legal_moves();
-            if lances.is_empty() {
-                break;
+        for rede in redes(2) {
+            let mut pos = Chess::default();
+            let mut acc = rede.acumulador(pos.board());
+            let mut rng = Aleatorio(99);
+            for _ in 0..40 {
+                let lances = pos.legal_moves();
+                if lances.is_empty() {
+                    break;
+                }
+                let k = ((rng.proximo() + 1.0) / 2.0 * lances.len() as f32) as usize % lances.len();
+                let depois = pos.clone().play(lances[k]).unwrap();
+                acc = rede.atualizar(&acc, pos.board(), depois.board());
+                pos = depois;
             }
-            let k = ((rng.proximo() + 1.0) / 2.0 * lances.len() as f32) as usize % lances.len();
-            let depois = pos.clone().play(lances[k]).unwrap();
-            acc = rede.atualizar(&acc, pos.board(), depois.board());
-            pos = depois;
-        }
-        let do_zero = rede.acumulador(pos.board());
-        for lado in 0..2 {
-            for j in 0..N_OCULTA1 {
-                assert!((acc.z1[lado][j] - do_zero.z1[lado][j]).abs() < 1e-3);
+            let do_zero = rede.acumulador(pos.board());
+            for lado in 0..2 {
+                for j in 0..rede.largura {
+                    assert!((acc.z1[lado][j] - do_zero.z1[lado][j]).abs() < 1e-3);
+                }
             }
         }
     }
@@ -573,20 +822,21 @@ mod testes {
     #[test]
     fn incremental_em_lances_especiais() {
         // roque, en passant e promoção com captura
-        let rede = Rede::aleatoria(3);
-        for (fen, uci) in [
-            ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1"),
-            ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "e5d6"),
-            ("1n2k3/P7/8/8/8/8/8/4K3 w - - 0 1", "a7b8q"),
-        ] {
-            let pos = de_fen(fen);
-            let m = uci.parse::<shakmaty::uci::UciMove>().unwrap().to_move(&pos).unwrap();
-            let depois = pos.clone().play(m).unwrap();
-            let inc = rede.atualizar(&rede.acumulador(pos.board()), pos.board(), depois.board());
-            let zero = rede.acumulador(depois.board());
-            for lado in 0..2 {
-                for j in 0..N_OCULTA1 {
-                    assert!((inc.z1[lado][j] - zero.z1[lado][j]).abs() < 1e-4, "{uci}");
+        for rede in redes(3) {
+            for (fen, uci) in [
+                ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1"),
+                ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "e5d6"),
+                ("1n2k3/P7/8/8/8/8/8/4K3 w - - 0 1", "a7b8q"),
+            ] {
+                let pos = de_fen(fen);
+                let m = uci.parse::<shakmaty::uci::UciMove>().unwrap().to_move(&pos).unwrap();
+                let depois = pos.clone().play(m).unwrap();
+                let inc = rede.atualizar(&rede.acumulador(pos.board()), pos.board(), depois.board());
+                let zero = rede.acumulador(depois.board());
+                for lado in 0..2 {
+                    for j in 0..rede.largura {
+                        assert!((inc.z1[lado][j] - zero.z1[lado][j]).abs() < 1e-4, "{uci}");
+                    }
                 }
             }
         }
@@ -596,67 +846,134 @@ mod testes {
     fn cores_trocadas_mesma_avaliacao() {
         // A posição espelhada (cores trocadas, tabuleiro virado, outra vez de
         // jogar) é a MESMA posição para quem joga: a rede tem que concordar.
-        let rede = Rede::aleatoria(4);
-        let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
-        let mut setup = pos.to_setup(shakmaty::EnPassantMode::Legal);
-        setup.mirror();
-        let espelhada: Chess = Chess::from_setup(setup, CastlingMode::Standard).unwrap();
-        let p1 = rede.probabilidades(&rede.acumulador(pos.board()), pos.turn());
-        let p2 = rede.probabilidades(&rede.acumulador(espelhada.board()), espelhada.turn());
-        for s in 0..N_SAIDAS {
-            assert!((p1[s] - p2[s]).abs() < 1e-5);
+        for rede in redes(4) {
+            let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
+            let mut setup = pos.to_setup(shakmaty::EnPassantMode::Legal);
+            setup.mirror();
+            let espelhada: Chess = Chess::from_setup(setup, CastlingMode::Standard).unwrap();
+            let p1 = rede.probabilidades(&rede.acumulador(pos.board()), pos.turn());
+            let p2 = rede.probabilidades(&rede.acumulador(espelhada.board()), espelhada.turn());
+            for s in 0..N_SAIDAS {
+                assert!((p1[s] - p2[s]).abs() < 1e-5);
+            }
         }
+    }
+
+    #[test]
+    fn crescida_nasce_igual_a_original() {
+        // Saída verde zerada: a soma das colunas é só a azul, posição a posição
+        let azul = Rede::aleatoria(20);
+        let crescida = azul.crescer(21);
+        assert_eq!(crescida.largura, 768);
+        assert_eq!(crescida.colunas.len(), 2);
+        let mut pos = Chess::default();
+        for _ in 0..30 {
+            let ligadas = entradas(pos.board(), pos.turn());
+            let (p1, p2) = (azul.probabilidades_de(&ligadas), crescida.probabilidades_de(&ligadas));
+            for s in 0..N_SAIDAS {
+                assert!((p1[s] - p2[s]).abs() < 1e-6, "{p1:?} {p2:?}");
+            }
+            let lances = pos.legal_moves();
+            if lances.is_empty() {
+                break;
+            }
+            pos = pos.clone().play(lances[lances.len() / 2]).unwrap();
+        }
+        // o custo: 384·96 + 96·32 + 32·3 da azul, mais 768·64 + 64·32 + 32·3 da verde
+        assert_eq!(azul.custo(), 384 * 96 + 96 * 32 + 32 * 3);
+        assert_eq!(crescida.custo(), azul.custo() + 768 * 64 + 64 * 32 + 32 * 3);
     }
 
     #[test]
     fn gradiente_bate_com_diferenca_finita() {
         // dL/dw ≈ (L(w + eps) - L(w - eps)) / (2 eps)
         // Se a retropropagação estiver certa, os dois números coincidem.
-        let rede = Rede::aleatoria(5);
-        let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
+        for rede in [Rede::aleatoria(5), crescida_ativa(5)] {
+            let pos = de_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
+            let ligadas = entradas(pos.board(), pos.turn());
+            let alvo = [0.0, 1.0, 0.0];
+
+            let mut g = rede.zerada_como();
+            rede.retropropagar(&ligadas, alvo, &mut g);
+
+            let erro_com = |r: &Rede| r.retropropagar(&ligadas, alvo, &mut r.zerada_como());
+            let eps = 2e-3;
+            let mut conferidos = 0;
+            // Em cada tensor, os 3 primeiros pesos com gradiente não nulo. (Com a
+            // CReLU, neurônios desligados dão gradiente exatamente zero, e conferir
+            // zero contra zero não prova nada.) Na rede crescida, w1 e b1 têm a
+            // parte azul e a verde: conferimos 3 de cada.
+            let (largura, crescida) = (rede.largura, rede.colunas.len() > 1);
+            let mut gs = g.clone();
+            let casos: Vec<(usize, usize)> = gs
+                .parametros_mut()
+                .iter()
+                .enumerate()
+                .flat_map(|(c, v)| {
+                    // nas crescidas, a metade verde do acumulador: j >= largura/2
+                    let verde = |i: &usize| c < 2 && crescida && i % largura >= largura / 2;
+                    let (azuis, verdes): (Vec<usize>, Vec<usize>) =
+                        v.iter().enumerate().filter(|(_, x)| x.abs() > 1e-4).map(|(i, _)| i).partition(|i| !verde(i));
+                    let mut escolhidos: Vec<(usize, usize)> = azuis.into_iter().take(3).map(|i| (c, i)).collect();
+                    escolhidos.extend(verdes.into_iter().take(3).map(|i| (c, i)));
+                    escolhidos
+                })
+                .collect();
+            // Na quina da CReLU (z exatamente em 0 ou 1) a derivada muda de valor;
+            // se um peso deixa algum z a menos de eps de uma quina, a diferença
+            // centrada mistura os dois lados. Por isso comparamos também com as
+            // diferenças de um lado só: a retropropagação tem que bater com uma delas.
+            let base = erro_com(&rede);
+            for (camada, i) in casos {
+                let mut mais = rede.clone();
+                let mut menos = rede.clone();
+                mais.parametros_mut()[camada][i] += eps;
+                menos.parametros_mut()[camada][i] -= eps;
+                let (l_mais, l_menos) = (erro_com(&mais), erro_com(&menos));
+                let numericos = [(l_mais - l_menos) / (2.0 * eps), (l_mais - base) / eps, (base - l_menos) / eps];
+                let analitico = g.parametros()[camada][i];
+                assert!(
+                    numericos.iter().any(|n| (n - analitico).abs() < 1e-3 + 0.05 * analitico.abs()),
+                    "tensor {camada}, peso {i}: numérico {numericos:?}, retropropagação {analitico}"
+                );
+                conferidos += 1;
+            }
+            let n_densas: usize = rede.colunas.iter().map(|c| c.densas.len()).sum();
+            let extra = if rede.colunas.len() > 1 { 2 } else { 0 }; // as metades verdes de w1 e b1
+            assert_eq!(conferidos, 3 * (2 + extra + 2 * n_densas), "toda camada precisa ter 3 pesos com gradiente");
+        }
+    }
+
+    #[test]
+    fn congelada_nao_muda_e_verde_aprende() {
+        let mut rede = Rede::aleatoria(30).crescer(31);
+        let original = rede.clone();
+        assert!(rede.congelar_antigas());
+        assert_eq!(rede.congelado, 384);
+        let pos = Chess::default();
         let ligadas = entradas(pos.board(), pos.turn());
         let alvo = [0.0, 1.0, 0.0];
-
-        let mut g = Rede::zerada();
-        rede.retropropagar(&ligadas, alvo, &mut g);
-
-        let erro_com = |r: &Rede| r.retropropagar(&ligadas, alvo, &mut Rede::zerada());
-        let eps = 2e-3;
-        let mut conferidos = 0;
-        // Em cada camada, os 3 primeiros pesos com gradiente não nulo. (Com a
-        // CReLU, neurônios desligados dão gradiente exatamente zero, e conferir
-        // zero contra zero não prova nada.)
-        let mut gs = g.clone();
-        let casos: Vec<(usize, usize)> = gs
-            .parametros_mut()
-            .iter()
-            .enumerate()
-            .flat_map(|(c, v)| {
-                v.iter().enumerate().filter(|(_, x)| x.abs() > 1e-4).take(3).map(move |(i, _)| (c, i))
-            })
-            .collect();
-        // Na quina da CReLU (z exatamente em 0 ou 1) a derivada muda de valor;
-        // se um peso deixa algum z a menos de eps de uma quina, a diferença
-        // centrada mistura os dois lados. Por isso comparamos também com as
-        // diferenças de um lado só: a retropropagação tem que bater com uma delas.
-        let base = erro_com(&rede);
-        for (camada, i) in casos {
-            let mut mais = rede.clone();
-            let mut menos = rede.clone();
-            mais.parametros_mut()[camada][i] += eps;
-            menos.parametros_mut()[camada][i] -= eps;
-            let (l_mais, l_menos) = (erro_com(&mais), erro_com(&menos));
-            let numericos = [(l_mais - l_menos) / (2.0 * eps), (l_mais - base) / eps, (base - l_menos) / eps];
-            let analitico = g.clone().parametros_mut()[camada][i];
-            assert!(
-                numericos.iter().any(|n| (n - analitico).abs() < 1e-3 + 0.05 * analitico.abs()),
-                "tensor {camada}, peso {i}: numérico {numericos:?}, retropropagação {analitico}"
-            );
-            eprintln!("tensor {camada} peso {i}: numérico {:+.5} retropropagação {analitico:+.5}", numericos[0]);
-            conferidos += 1;
+        let antes = rede.probabilidades_de(&ligadas)[EMPATE];
+        let mut adam = Adam::novo(1e-3, &rede);
+        for _ in 0..100 {
+            let mut g = rede.zerada_como();
+            rede.retropropagar(&ligadas, alvo, &mut g);
+            rede.aplicar_adam(&mut g, &mut adam, 1);
         }
-        let n_tensores = 2 + 2 * rede.densas.len();
-        assert_eq!(conferidos, 3 * n_tensores, "toda camada precisa ter 3 pesos com gradiente");
+        // azul intacta: a parte azul do acumulador e as densas da coluna azul
+        for i in 0..N_ENTRADAS {
+            assert_eq!(&rede.w1[i * 768..i * 768 + 384], &original.w1[i * 768..i * 768 + 384]);
+        }
+        assert_eq!(&rede.b1[..384], &original.b1[..384]);
+        for (a, b) in rede.colunas[0].densas.iter().zip(&original.colunas[0].densas) {
+            assert_eq!(a.w, b.w);
+            assert_eq!(a.b, b.b);
+        }
+        // e a verde aprendeu o exemplo
+        let depois = rede.probabilidades_de(&ligadas)[EMPATE];
+        assert!(depois > antes + 0.1, "{antes} -> {depois}");
+        // rede de uma coluna: não há o que congelar
+        assert!(!Rede::aleatoria(1).congelar_antigas());
     }
 
     #[test]
@@ -666,9 +983,9 @@ mod testes {
         let pos = Chess::default();
         let ligadas = entradas(pos.board(), pos.turn());
         let alvo = [0.0, 1.0, 0.0];
-        let mut adam = Adam::novo(1e-3);
+        let mut adam = Adam::novo(1e-3, &rede);
         for _ in 0..200 {
-            let mut g = Rede::zerada();
+            let mut g = rede.zerada_como();
             rede.retropropagar(&ligadas, alvo, &mut g);
             rede.aplicar_adam(&mut g, &mut adam, 1);
         }
@@ -689,34 +1006,58 @@ mod testes {
                 (ligadas, alvo)
             })
             .collect();
-        let mut simples = Rede::aleatoria(8);
-        let mut paralela = simples.clone();
-        let (mut adam_s, mut adam_p) = (Adam::novo(1e-3), Adam::novo(1e-3));
-        let mut gs = Rede::gradientes();
-        for _ in 0..3 {
-            let mut g = Rede::zerada();
-            let erro_s: f64 = lote.iter().map(|(l, a)| simples.retropropagar(l, *a, &mut g) as f64).sum();
-            simples.aplicar_adam(&mut g, &mut adam_s, lote.len());
-            let erro_p = paralela.treinar_lote(&mut gs, &mut adam_p, &lote, |(l, a)| (l, *a));
-            assert!((erro_s - erro_p).abs() < 1e-3 * erro_s.abs(), "{erro_s} {erro_p}");
-        }
-        for (a, b) in simples.parametros().into_iter().zip(paralela.parametros()) {
-            for (x, y) in a.iter().zip(b) {
-                assert!((x - y).abs() < 1e-5, "{x} {y}");
+        for mut simples in [Rede::aleatoria(8), crescida_ativa(8)] {
+            let mut paralela = simples.clone();
+            let (mut adam_s, mut adam_p) = (Adam::novo(1e-3, &simples), Adam::novo(1e-3, &simples));
+            let mut gs = simples.gradientes();
+            for _ in 0..3 {
+                let mut g = simples.zerada_como();
+                let erro_s: f64 = lote.iter().map(|(l, a)| simples.retropropagar(l, *a, &mut g) as f64).sum();
+                simples.aplicar_adam(&mut g, &mut adam_s, lote.len());
+                let erro_p = paralela.treinar_lote(&mut gs, &mut adam_p, &lote, |(l, a)| (l, *a));
+                assert!((erro_s - erro_p).abs() < 1e-3 * erro_s.abs(), "{erro_s} {erro_p}");
+            }
+            for (a, b) in simples.parametros().into_iter().zip(paralela.parametros()) {
+                for (x, y) in a.iter().zip(b) {
+                    assert!((x - y).abs() < 1e-5, "{x} {y}");
+                }
             }
         }
     }
 
     #[test]
     fn salvar_e_carregar() {
-        let mut rede = Rede::aleatoria(7);
-        let arquivo = std::env::temp_dir().join("xadrez_neural_teste.rede");
+        for (k, rede) in redes(7).into_iter().enumerate() {
+            let arquivo = std::env::temp_dir().join(format!("xadrez_neural_teste_{k}.rede"));
+            let arquivo = arquivo.to_str().unwrap();
+            rede.salvar(arquivo).unwrap();
+            let lida = Rede::carregar(arquivo).unwrap();
+            assert_eq!(rede.arquitetura(), lida.arquitetura());
+            for (a, b) in rede.parametros().into_iter().zip(lida.parametros()) {
+                assert_eq!(a, b);
+            }
+            std::fs::remove_file(arquivo).unwrap();
+        }
+    }
+
+    #[test]
+    fn carrega_o_formato_antigo() {
+        // Um arquivo XNR2 (como auto3.rede): o cabeçalho antigo e os mesmos
+        // números na mesma ordem
+        let rede = Rede::aleatoria(8);
+        let mut bytes = Rede::cabecalho_v2();
+        for v in rede.parametros() {
+            for x in v {
+                bytes.extend(x.to_le_bytes());
+            }
+        }
+        let arquivo = std::env::temp_dir().join("xadrez_neural_teste_v2.rede");
         let arquivo = arquivo.to_str().unwrap();
-        rede.salvar(arquivo).unwrap();
+        std::fs::write(arquivo, bytes).unwrap();
         let lida = Rede::carregar(arquivo).unwrap();
-        assert_eq!(rede.w1, lida.w1);
-        assert_eq!(rede.densas[1].w, lida.densas[1].w);
-        assert_eq!(rede.densas[2].b, lida.densas[2].b);
+        assert_eq!(lida.arquitetura(), rede.arquitetura());
+        assert_eq!(lida.w1, rede.w1);
+        assert_eq!(lida.colunas[0].densas[2].b, rede.colunas[0].densas[2].b);
         std::fs::remove_file(arquivo).unwrap();
     }
 }

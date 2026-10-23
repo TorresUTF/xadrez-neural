@@ -4,7 +4,7 @@
 //
 // Dois avaliadores com a mesma interface (o trait `Avaliador`):
 //   Material — Etapa 1, só contagem de material. É a linha de base.
-//   Rede     — Etapa 2, a rede 768 -> 256 -> 32 -> 3 (vitória/empate/derrota).
+//   Rede     — Etapa 2, a rede 768 -> 384 -> 96 -> 32 -> 3 (vitória/empate/derrota).
 //
 // A busca não sabe qual dos dois está usando. Cada avaliador pode levar
 // um "estado" de lance em lance: a rede leva o acumulador (atualização

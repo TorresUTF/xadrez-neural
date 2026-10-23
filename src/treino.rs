@@ -151,8 +151,8 @@ pub fn treinar_supervisionado(rede: &mut Rede, mut todos: Vec<Exemplo>, nomes: &
     let mut treino: Vec<&Exemplo> = treino.iter().collect();
     println!("{} exemplos de treino, {} de validação\n", treino.len(), validacao.len());
 
-    let mut gs = Rede::gradientes();
-    let mut adam = Adam::novo(TAXA);
+    let mut gs = rede.gradientes();
+    let mut adam = Adam::novo(TAXA, rede);
 
     let m = medir(rede, &validacao);
     println!("época  0: validação erro {:.4}  acerto {:5.1}%  P(certa) {:.3}", m.erro, 100.0 * m.acerto, m.p_certa);
@@ -206,7 +206,8 @@ mod testes {
         let validacao: Vec<&Exemplo> = validacao.iter().collect();
         let mut treino: Vec<&Exemplo> = treino.iter().collect();
         let mut rede = Rede::aleatoria(1);
-        epoca(&mut rede, &mut Rede::gradientes(), &mut Adam::novo(TAXA), &mut treino, &mut rng);
+        let (mut gs, mut adam) = (rede.gradientes(), Adam::novo(TAXA, &rede));
+        epoca(&mut rede, &mut gs, &mut adam, &mut treino, &mut rng);
         let m = medir(&rede, &validacao);
         assert!(m.acerto > 0.9, "acerto {}", m.acerto);
     }

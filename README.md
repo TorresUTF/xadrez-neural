@@ -17,6 +17,9 @@ cargo run --release -- torneio auto.rede ab:1 ab:3 100           # métodos de e
 cargo run --release -- torneio auto.rede cert:200ms ab:200ms 100 syzygy
 cargo run --release -- torneio auto3.rede ab:200ms ab:200ms@auto2.rede 100 syzygy   # duas redes, mesmo tempo
 cargo run --release -- torneio auto3.rede ab:200ms "uci=lc0\lc0.exe --weights=lc0\maia-1100.pb.gz;go=nodes 1" 100 syzygy   # Etapa 4: contra o Maia
+cargo run --release -- crescer auto3.rede crescida.rede         # rede crescida: auto3 + uma coluna nova (nasce igual à auto3)
+cargo run --release -- autojogo 300 64 crescida2.rede crescida.rede syzygy --congelar     # treina só a coluna nova
+cargo run --release -- autojogo 300 64 crescida3.rede crescida2.rede syzygy --taxa=0.0003 # depois, tudo junto com passo menor
 ```
 
 Para usar as tablebases: rode `powershell -ExecutionPolicy Bypass -File baixar_syzygy.ps1`, que baixa os arquivos `.rtbw` de até 5 peças para a pasta `syzygy`, e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).
