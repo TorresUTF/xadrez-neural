@@ -60,6 +60,10 @@ pub fn ligadas(e: &Entrada) -> Vec<usize> {
 // avalia o lote inteiro junto.
 pub trait AvaliadorLote: Sync {
     fn notas(&self, entradas: &[Entrada]) -> Vec<i32>;
+    // o custo fixo de cada chamada (a GPU paga ida e volta mesmo com 1 posição)
+    fn latencia(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 impl AvaliadorLote for Rede {
@@ -348,30 +352,29 @@ const MAX_AVALIACOES: usize = 20_000_000;
 
 // Aprofundamento por tempo: profundidade 1, 2, 3... A força bruta não
 // pode parar no meio (a nota só sai no fim), então antes de cada
-// profundidade estimamos o tempo dela pelo crescimento da anterior
-// (t_próx ≈ t_atual · t_atual / t_anterior) e só começamos se couber.
+// profundidade estimamos o tempo dela e só começamos se couber:
+//      t_próx ≈ latência + (t_atual - latência) · r
+// r = quantas vezes a árvore cresceu da profundidade anterior para esta
+// (na primeira, 30, o número típico de lances). A latência da GPU é fixa:
+// não cresce com a árvore, então sai da conta antes de multiplicar.
 pub fn por_tempo(pos: &Chess, historico: &[Zobrist64], limite: Duration, avaliador: &dyn AvaliadorLote, opcoes: &Opcoes) -> Resultado {
     let inicio = Instant::now();
+    let latencia = avaliador.latencia().as_secs_f64();
     let mut r = melhor_lance(pos, historico, 1, avaliador, opcoes);
-    let mut tempos = vec![inicio.elapsed()];
+    let mut ultimo = inicio.elapsed().as_secs_f64();
+    let mut crescimento = 30.0;
     for prof in 2..=20 {
         if r.lance.is_none() || r.nota.abs() > MATE - 1000 {
             break;
         }
-        let ultimo = *tempos.last().unwrap();
-        let fator = match tempos.len() {
-            1 => 30.0, // sem histórico: o fator típico de uma profundidade a mais
-            n => (ultimo.as_secs_f64() / tempos[n - 2].as_secs_f64().max(1e-6)).clamp(5.0, 100.0),
-        };
-        let fator_avaliacoes = if prof == 2 { 30.0 } else { fator };
-        if inicio.elapsed().as_secs_f64() + ultimo.as_secs_f64() * fator > limite.as_secs_f64()
-            || r.avaliacoes as f64 * fator_avaliacoes > MAX_AVALIACOES as f64
-        {
+        let estimado = latencia + (ultimo - latencia).max(0.0) * crescimento;
+        if inicio.elapsed().as_secs_f64() + estimado > limite.as_secs_f64() || r.avaliacoes as f64 * crescimento > MAX_AVALIACOES as f64 {
             break;
         }
         let t = Instant::now();
         let mut novo = melhor_lance(pos, historico, prof, avaliador, opcoes);
-        tempos.push(t.elapsed());
+        ultimo = t.elapsed().as_secs_f64();
+        crescimento = (novo.avaliacoes as f64 / r.avaliacoes.max(1) as f64).clamp(3.0, 100.0);
         novo.nos += r.nos;
         novo.avaliacoes += r.avaliacoes;
         r = novo;
