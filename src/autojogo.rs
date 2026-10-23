@@ -287,7 +287,14 @@ pub use crate::paralelo::threads;
 // ---------------------------------------------------------------------
 // O laço da Etapa 3
 // ---------------------------------------------------------------------
-pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>, arquivo: &str, pasta_syzygy: Option<&str>) {
+// `taxa`: a taxa do Adam (1e-3 do zero; menor para afinar uma rede pronta).
+// `congelar`: na rede crescida, treina só a coluna verde (ver rede.rs).
+pub struct Opcoes {
+    pub taxa: f32,
+    pub congelar: bool,
+}
+
+pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>, arquivo: &str, pasta_syzygy: Option<&str>, opcoes: Opcoes) {
     use crate::avaliacao::Material;
     let cfg = CONFIG_PADRAO;
     let inicio = Instant::now();
@@ -304,8 +311,18 @@ pub fn treinar(rodadas: usize, partidas_por_rodada: usize, inicial: Option<&str>
         None => Rede::aleatoria(0x2545F4914F6CDD1D),
     };
     let original = rede.clone();
-    let mut gs = Rede::gradientes();
-    let mut adam = Adam::novo(1e-3);
+    if opcoes.congelar && !rede.congelar_antigas() {
+        println!("Aviso: a rede tem uma coluna só, não há o que congelar (treinando tudo)");
+    }
+    let mut gs = rede.gradientes();
+    let mut adam = Adam::novo(opcoes.taxa, &rede);
+    println!(
+        "Rede: {} ({} mil multiplicações por avaliação), taxa {}{}",
+        rede.descricao(),
+        rede.custo() / 1000,
+        opcoes.taxa,
+        if rede.congelado > 0 { ", colunas antigas congeladas" } else { "" }
+    );
     let mut rng = Aleatorio(0xD1B54A32D192ED03);
     println!(
         "Autojogo: {rodadas} rodadas de {partidas_por_rodada} partidas, profundidade {}, λ = {}, {} threads",

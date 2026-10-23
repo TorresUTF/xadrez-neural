@@ -17,9 +17,13 @@
 //                                             -> treina com tablebases Syzygy: finais de 3 a 5
 //                                                peças, 5000 posições por combinação, 10 épocas
 //   cargo run --release -- autojogo 100 64 auto.rede [inicial.rede] [pasta da syzygy]
-//   cargo run --release -- torneio auto.rede ab:1 ab:3 100 [pasta da syzygy]
 //                                             -> Etapa 3: 100 rodadas de 64 partidas da rede
 //                                                contra si mesma (TD-Leaf), salvando em auto.rede
+//                                                (opções: --taxa=0.0003, --congelar)
+//   cargo run --release -- crescer auto3.rede crescida.rede
+//                                             -> rede crescida: auto3 vira a coluna azul e
+//                                                ganha uma coluna verde (ver rede.rs)
+//   cargo run --release -- torneio auto.rede ab:1 ab:3 100 [pasta da syzygy]
 //
 // Sem arquivo, "rede" usa pesos aleatórios (semente fixa): ainda não há
 // treino nesta etapa, então ela joga mal de propósito.
@@ -195,7 +199,12 @@ fn escolher_rede(arg: Option<&str>) -> Option<(Rede, String)> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    // opções "--nome" ou "--nome=valor" podem vir em qualquer lugar; o resto é posicional
+    let (opcoes, args): (Vec<String>, Vec<String>) = std::env::args().partition(|a| a.starts_with("--"));
+    let opcao = |nome: &str| opcoes.iter().find_map(|o| {
+        let o = &o[2..];
+        if o == nome { Some("") } else { o.strip_prefix(nome)?.strip_prefix('=') }
+    });
     let arg = |i: usize| args.get(i).map(String::as_str);
     match arg(1) {
         Some("finais") => {
@@ -213,7 +222,35 @@ fn main() {
         Some("autojogo") => {
             let rodadas = arg(2).and_then(|e| e.parse().ok()).unwrap_or(100);
             let partidas = arg(3).and_then(|e| e.parse().ok()).unwrap_or(64);
-            autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"), arg(6));
+            let taxa = match opcao("taxa") {
+                Some(t) => t.parse().unwrap_or_else(|_| {
+                    eprintln!("--taxa={t}: não é um número");
+                    std::process::exit(1)
+                }),
+                None => 1e-3,
+            };
+            let opcoes = autojogo::Opcoes { taxa, congelar: opcao("congelar").is_some() };
+            autojogo::treinar(rodadas, partidas, arg(5), arg(4).unwrap_or("auto.rede"), arg(6), opcoes);
+        }
+        Some("crescer") => {
+            let (Some(base), Some(saida)) = (arg(2), arg(3)) else {
+                eprintln!("uso: crescer <rede treinada> <saída>");
+                std::process::exit(1);
+            };
+            let Some((rede, _)) = escolher_rede(Some(base)) else { unreachable!() };
+            if rede.colunas.len() > 1 {
+                eprintln!("{base} já é uma rede crescida");
+                std::process::exit(1);
+            }
+            let crescida = rede.crescer(0x5DEECE66D);
+            println!("{base}: {} ({} mil multiplicações por avaliação)", rede.descricao(), rede.custo() / 1000);
+            println!("{saida}: {} ({} mil multiplicações por avaliação)", crescida.descricao(), crescida.custo() / 1000);
+            if let Err(e) = crescida.salvar(saida) {
+                eprintln!("Não consegui salvar {saida}: {e}");
+                std::process::exit(1);
+            }
+            println!("Salva. Ela começa avaliando exatamente como {base}; treine a coluna nova com");
+            println!("  autojogo <rodadas> 64 <saída> {saida} <pasta syzygy> --congelar");
         }
         Some("torneio") => {
             let (Some(a), Some(b)) = (arg(3), arg(4)) else {
