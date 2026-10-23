@@ -29,6 +29,7 @@ mod autojogo;
 mod avaliacao;
 mod busca;
 mod certeza;
+mod externo;
 mod finais;
 mod paralelo;
 mod rede;
@@ -217,7 +218,7 @@ fn main() {
         Some("torneio") => {
             let (Some(a), Some(b)) = (arg(3), arg(4)) else {
                 eprintln!("uso: torneio <rede> <jogador A> <jogador B> [pares=100] [pasta da syzygy]");
-                eprintln!("jogadores: ab:3, ab:200ms, mat:3, cert:200ms, cert:200ms:0.3");
+                eprintln!("jogadores: ab:3, ab:200ms, mat:3, cert:200ms, cert:200ms:0.3, \"uci=<motor>;go=nodes 1\"");
                 std::process::exit(1);
             };
             let (rede, nome) = escolher_rede(arg(2)).unwrap_or_else(|| (Rede::aleatoria(0x2545F4914F6CDD1D), "aleatória".into()));

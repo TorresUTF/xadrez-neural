@@ -15,6 +15,8 @@ cargo run --release -- syzygy syzygy 5 20000 10 syzygy.rede   # finais de 3 a 5 
 cargo run --release -- autojogo 200 64 auto.rede syzygy.rede syzygy  # Etapa 3: autojogo com TD-Leaf, finais pela Syzygy
 cargo run --release -- torneio auto.rede ab:1 ab:3 100           # métodos de escolher o lance, uns contra os outros
 cargo run --release -- torneio auto.rede cert:200ms ab:200ms 100 syzygy
+cargo run --release -- torneio auto3.rede ab:200ms ab:200ms@auto2.rede 100 syzygy   # duas redes, mesmo tempo
+cargo run --release -- torneio auto3.rede ab:200ms "uci=lc0\lc0.exe --weights=lc0\maia-1100.pb.gz;go=nodes 1" 100 syzygy   # Etapa 4: contra o Maia
 ```
 
 Para usar as tablebases: rode `powershell -ExecutionPolicy Bypass -File baixar_syzygy.ps1`, que baixa os arquivos `.rtbw` de até 5 peças para a pasta `syzygy`, e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).
@@ -31,6 +33,7 @@ O `.cargo/config.toml` compila para o processador da máquina (`target-cpu=nativ
 - `src/syzygy.rs`: sorteia posições de cada combinação de material até 5 (ou 6) peças e rotula com as tablebases Syzygy.
 - `src/certeza.rs`: busca guiada pela certeza: a árvore cresce onde a rede está em dúvida (V/E/D), e para onde ela tem certeza.
 - `src/torneio.rs`: torneio entre métodos de escolher o lance (`ab:3`, `ab:200ms`, `mat:3`, `cert:200ms`), com aberturas pareadas e diferença de Elo com margem de erro.
+- `src/externo.rs`: conversa com outro motor pelo protocolo UCI (Etapa 4: o Maia rodando no lc0).
 - `src/paralelo.rs`: divide o trabalho entre as threads por uma fila, para nenhum núcleo ficar parado.
 - `src/autojogo.rs`: Etapa 3. Autojogo em paralelo com TD-Leaf(λ) em três classes, finais de 3 peças decididos pelo gabarito, e confrontos para medir (rede contra material, rede contra a inicial).
 
