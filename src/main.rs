@@ -38,6 +38,9 @@ mod busca;
 mod certeza;
 mod externo;
 mod finais;
+#[cfg(feature = "gpu")]
+mod gpu;
+mod lote;
 mod paralelo;
 mod progresso;
 mod rede;
@@ -273,6 +276,22 @@ fn main() {
             let (rede, nome) = escolher_rede(arg(2)).unwrap_or_else(|| (Rede::aleatoria(0x2545F4914F6CDD1D), "aleatória".into()));
             let pares = arg(5).and_then(|e| e.parse().ok()).unwrap_or(100);
             torneio::torneio(&rede, &nome, a, b, pares, arg(6));
+        }
+        Some("medir") => {
+            // medir <rede> [cpu]: quanto custa a busca em lote (Etapa 5)
+            let (rede, nome) = escolher_rede(arg(2)).unwrap_or_else(|| (Rede::aleatoria(0x2545F4914F6CDD1D), "aleatória".into()));
+            println!("Rede {nome}: {}\n", rede.descricao());
+            let amostra = lote::medir_arvores(&lote::OPCOES_PADRAO);
+            lote::medir_cpu(&rede, &amostra);
+            #[cfg(feature = "gpu")]
+            {
+                let gpu = if arg(3) == Some("cpu") { gpu::RedeGpu::nova(&rede, gpu::cpu()) } else { gpu::abrir(&rede) };
+                gpu::medir(&rede, &gpu, &amostra);
+                lote::medir_jogada("rede na GPU", &gpu);
+            }
+            #[cfg(not(feature = "gpu"))]
+            println!("\n(sem GPU: compile com --features gpu para medir a placa)");
+            lote::medir_jogada("rede na CPU", &rede);
         }
         Some("uci") => match escolher_rede(arg(2)) {
             Some((rede, nome)) => uci(&rede, &nome),

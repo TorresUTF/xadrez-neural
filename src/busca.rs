@@ -53,13 +53,13 @@ pub struct Busca<'a, A: Avaliador> {
     abortou: bool,
 }
 
-fn hash(pos: &Chess) -> Zobrist64 {
+pub fn hash(pos: &Chess) -> Zobrist64 {
     pos.zobrist_hash(EnPassantMode::Legal)
 }
 
 // Ordenação MVV-LVA: primeiro capturar a peça mais valiosa (Most Valuable
 // Victim) com a menos valiosa (Least Valuable Attacker). Promoções também cedo.
-fn ordenar(lances: &mut MoveList) {
+pub fn ordenar(lances: &mut MoveList) {
     lances.sort_by_key(|m| {
         let vitima = m.capture().map(valor).unwrap_or(0);
         let promocao = m.promotion().map(valor).unwrap_or(0);
