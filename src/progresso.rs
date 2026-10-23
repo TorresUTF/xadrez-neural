@@ -323,7 +323,7 @@ mod testes {
     #[test]
     fn nota_de_posicao_ganha_usa_o_progresso() {
         let mut rede = rede_ganhando();
-        let pos = Chess::default();
+        let pos: Chess = "8/8/8/4k3/8/8/8/3QK3 w - - 0 1".parse::<shakmaty::fen::Fen>().unwrap().into_position(shakmaty::CastlingMode::Standard).unwrap();
         let acc = rede.acumulador(pos.board());
         // progresso fixo pelo viés da última camada rosa: 0,25 = 25 meios-lances
         let rosa = rede.colunas.last_mut().unwrap().densas.last_mut().unwrap();
@@ -335,6 +335,9 @@ mod testes {
         assert_eq!(rede.nota(&acc, &pos), 1500 - 4 * 5);
         // sem a coluna rosa: a nota de sempre
         assert_eq!(rede.sem_progresso().nota(&acc, &pos), 1000);
+        // no meio-jogo a rosa não é consultada (ela só viu finais)
+        let inicial = Chess::default();
+        assert_eq!(rede.nota(&rede.acumulador(inicial.board()), &inicial), 1000);
     }
 
     #[test]
