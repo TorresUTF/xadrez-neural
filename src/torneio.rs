@@ -10,6 +10,10 @@
 //   mat:3       alfa-beta com o material no lugar da rede (linha de base)
 //   cert:200ms  busca guiada pela certeza (certeza.rs), 200 ms por lance
 //   cert:200ms:0.3   ... com bônus de incerteza 0,3 (padrão 0,5)
+//   "uci=<comando>;go=nodes 1"   um motor externo pelo UCI (externo.rs),
+//                    ex.: o Maia-1100 rodando no lc0 (Etapa 4)
+//   ab:200ms@auto3.rede   qualquer jogador com "@arquivo" usa essa rede
+//                    no lugar da rede do torneio (para comparar redes)
 //
 // Para comparar métodos de forma justa, o certo é o MESMO TEMPO por lance
 // dos dois lados: vence quem usa melhor o mesmo segundo. Profundidade
@@ -40,11 +44,12 @@ pub enum Limite {
     Tempo(Duration),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Metodo {
     AlfaBeta(Limite),
     Material(Limite),
     Certeza { tempo: Duration, bonus: f32 },
+    Externo(crate::externo::Externo),
 }
 
 pub struct Jogador<'a> {
@@ -62,6 +67,9 @@ fn limite(texto: &str) -> Option<Limite> {
 
 // "ab:3", "ab:200ms", "mat:3", "cert:200ms", "cert:200ms:0.3"
 pub fn ler(texto: &str) -> Option<Metodo> {
+    if let Some(resto) = texto.strip_prefix("uci=") {
+        return crate::externo::ler(resto).map(Metodo::Externo);
+    }
     let partes: Vec<&str> = texto.split(':').collect();
     match partes.as_slice() {
         ["ab", l] => limite(l).map(Metodo::AlfaBeta),
@@ -79,14 +87,15 @@ pub fn ler(texto: &str) -> Option<Metodo> {
 }
 
 impl Jogador<'_> {
-    fn lance(&self, pos: &Chess, historico: &[Zobrist64], verdade: &Verdade) -> Move {
-        let r = match self.metodo {
-            Metodo::AlfaBeta(Limite::Profundidade(p)) => Busca::nova(self.rede, historico.to_vec()).melhor_lance(pos, p),
-            Metodo::AlfaBeta(Limite::Tempo(t)) => Busca::nova(self.rede, historico.to_vec()).por_tempo(pos, t),
-            Metodo::Material(Limite::Profundidade(p)) => Busca::nova(&Material, historico.to_vec()).melhor_lance(pos, p),
-            Metodo::Material(Limite::Tempo(t)) => Busca::nova(&Material, historico.to_vec()).por_tempo(pos, t),
+    fn lance(&self, pos: &Chess, historico: &[Zobrist64], lances: &[Move], verdade: &Verdade) -> Move {
+        let r = match &self.metodo {
+            Metodo::AlfaBeta(Limite::Profundidade(p)) => Busca::nova(self.rede, historico.to_vec()).melhor_lance(pos, *p),
+            Metodo::AlfaBeta(Limite::Tempo(t)) => Busca::nova(self.rede, historico.to_vec()).por_tempo(pos, *t),
+            Metodo::Material(Limite::Profundidade(p)) => Busca::nova(&Material, historico.to_vec()).melhor_lance(pos, *p),
+            Metodo::Material(Limite::Tempo(t)) => Busca::nova(&Material, historico.to_vec()).por_tempo(pos, *t),
+            Metodo::Externo(e) => return crate::externo::lance(e, pos, lances),
             Metodo::Certeza { tempo, bonus } => {
-                let cfg = certeza::Config { tempo, bonus };
+                let cfg = certeza::Config { tempo: *tempo, bonus: *bonus };
                 return Busca2::nova(self.rede, verdade).melhor_lance(pos, historico, &cfg).lance.unwrap();
             }
         };
@@ -100,6 +109,7 @@ fn partida(brancas: &Jogador, pretas: &Jogador, ab: &[Move], verdade: &Verdade, 
     let cfg = Config { max_meios_lances: 300, ..CONFIG_PADRAO };
     let mut pos = Chess::default();
     let mut historico = Vec::new();
+    let mut lances = Vec::new();
     let mut n = 0;
     loop {
         if let Some(v) = fim(&pos, &historico, verdade, n, &cfg) {
@@ -115,11 +125,12 @@ fn partida(brancas: &Jogador, pretas: &Jogador, ab: &[Move], verdade: &Verdade, 
         } else {
             let lado = if pos.turn().is_white() { 0 } else { 1 };
             let t = Instant::now();
-            let m = [brancas, pretas][lado].lance(&pos, &historico, verdade);
+            let m = [brancas, pretas][lado].lance(&pos, &historico, &lances, verdade);
             tempos[lado] += t.elapsed();
             m
         };
         historico.push(hash(&pos));
+        lances.push(m);
         pos = pos.play(m).unwrap();
         n += 1;
     }
@@ -170,12 +181,27 @@ pub fn jogar(a: &Jogador, b: &Jogador, pares: usize, verdade: &Verdade, semente:
 pub fn torneio(rede: &Rede, nome_rede: &str, texto_a: &str, texto_b: &str, pares: usize, pasta_syzygy: Option<&str>) {
     let ler_ou_sair = |t: &str| {
         ler(t).unwrap_or_else(|| {
-            eprintln!("Não entendi o jogador \"{t}\". Exemplos: ab:3, ab:200ms, mat:3, cert:200ms, cert:200ms:0.3");
+            eprintln!("Não entendi o jogador \"{t}\". Exemplos: ab:3, ab:200ms, mat:3, cert:200ms, cert:200ms:0.3, \"uci=lc0.exe --weights=maia-1100.pb.gz;go=nodes 1\"");
             std::process::exit(1);
         })
     };
-    let a = Jogador { nome: texto_a.into(), metodo: ler_ou_sair(texto_a), rede };
-    let b = Jogador { nome: texto_b.into(), metodo: ler_ou_sair(texto_b), rede };
+    // "ab:200ms@auto3.rede": este jogador usa outra rede (para comparar redes)
+    let separar = |t: &str| -> (String, Option<Rede>) {
+        match t.rsplit_once('@').filter(|_| !t.starts_with("uci=")) {
+            Some((metodo, arquivo)) => match Rede::carregar(arquivo) {
+                Ok(r) => (metodo.to_string(), Some(r)),
+                Err(e) => {
+                    eprintln!("Não consegui ler {arquivo}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => (t.to_string(), None),
+        }
+    };
+    let (metodo_a, rede_a) = separar(texto_a);
+    let (metodo_b, rede_b) = separar(texto_b);
+    let a = Jogador { nome: texto_a.into(), metodo: ler_ou_sair(&metodo_a), rede: rede_a.as_ref().unwrap_or(rede) };
+    let b = Jogador { nome: texto_b.into(), metodo: ler_ou_sair(&metodo_b), rede: rede_b.as_ref().unwrap_or(rede) };
     let verdade = Verdade::nova(pasta_syzygy.map(crate::syzygy::abrir));
     println!("Torneio: {} contra {}, {} partidas ({} aberturas, cores trocadas), rede {nome_rede}, {} threads", a.nome, b.nome, 2 * pares, pares, threads());
     let inicio = Instant::now();
@@ -206,6 +232,7 @@ mod testes {
         assert!(ler("cert:3").is_none()); // a busca da certeza só tem limite de tempo
         assert!(ler("ab:0").is_none());
         assert!(ler("xyz:3").is_none());
+        assert!(matches!(ler("uci=lc0.exe --weights=maia.pb.gz;go=nodes 1"), Some(Metodo::Externo(e)) if e.go == "nodes 1"));
     }
 
     #[test]
