@@ -285,7 +285,13 @@ fn main() {
             lote::medir_cpu(&rede, &amostra);
             #[cfg(feature = "gpu")]
             {
-                let gpu = if arg(3) == Some("cpu") { gpu::RedeGpu::nova(&rede, gpu::cpu()) } else { gpu::abrir(&rede) };
+                let gpu = if arg(3) == Some("cpu") {
+                    let mut g = gpu::RedeGpu::nova(&rede, gpu::cpu());
+                    g.aquecer();
+                    g
+                } else {
+                    gpu::abrir(&rede)
+                };
                 gpu::medir(&rede, &gpu, &amostra);
                 lote::medir_jogada("rede na GPU", &gpu);
             }

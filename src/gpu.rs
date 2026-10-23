@@ -31,7 +31,7 @@ use burn::prelude::*;
 use burn::tensor::activation::softmax;
 use burn::tensor::IndexingUpdateOp;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct Camada {
     w: Tensor<2>, // entradas × saídas (a transposta da Densa da CPU)
@@ -57,11 +57,13 @@ pub struct RedeGpu {
     // elas esperam a vez aqui em vez de disputar a memória da GPU)
     pesos: Mutex<Pesos>,
     pub lote: usize, // posições por envio
+    pub latencia: Duration,
 }
 
 // Posições por envio. Com a rede de 1024 neurônios, um lote de 16 mil usa
 // ~50 MB para X e ~70 MB para Z1: cabe com folga nos 8 GB.
 pub const LOTE_PADRAO: usize = 16_384;
+pub const MIN_LOTE: usize = 1024;
 
 pub fn placa() -> Device {
     Device::wgpu(DeviceKind::DefaultDevice)
@@ -71,8 +73,8 @@ pub fn placa() -> Device {
 // wgpu entra em pânico numa thread dele; aqui vira uma mensagem)
 pub fn abrir(rede: &Rede) -> RedeGpu {
     let teste = std::panic::catch_unwind(|| {
-        let gpu = RedeGpu::nova(rede, placa());
-        gpu.avaliar(&[[crate::lote::VAZIO; MAX_PECAS]]);
+        let mut gpu = RedeGpu::nova(rede, placa());
+        gpu.aquecer();
         gpu
     });
     teste.unwrap_or_else(|_| {
@@ -123,7 +125,7 @@ impl RedeGpu {
             b1: matriz(rede.b1.clone(), 1, l, &device),
             colunas,
         };
-        RedeGpu { device, pesos: Mutex::new(pesos), lote: LOTE_PADRAO }
+        RedeGpu { device, pesos: Mutex::new(pesos), lote: LOTE_PADRAO, latencia: Duration::ZERO }
     }
 
     // (P_V, P_E, P_D) e o progresso (se a rede tiver) de cada posição
@@ -140,9 +142,16 @@ impl RedeGpu {
         (probs, progresso)
     }
 
+    // Envia sempre um lote de tamanho múltiplo de MIN_LOTE (até `lote`),
+    // completando com posições vazias: a Burn compila e ajusta os kernels
+    // para cada formato de matriz, e um formato novo a cada chamada custava
+    // dezenas de milissegundos. Assim há só 16 formatos, compilados uma
+    // vez em aquecer().
     fn avaliar_pedaco(&self, entradas: &[Entrada]) -> (Vec<[f32; N_SAIDAS]>, Option<Vec<f32>>) {
-        let b = entradas.len();
-        let indices: Vec<i32> = entradas.iter().flatten().map(|&i| i as i32).collect();
+        let n = entradas.len();
+        let b = n.div_ceil(MIN_LOTE).max(1).saturating_mul(MIN_LOTE).min(self.lote.max(n));
+        let mut indices: Vec<i32> = entradas.iter().flatten().map(|&i| i as i32).collect();
+        indices.resize(b * MAX_PECAS, crate::lote::VAZIO as i32);
         let pesos = self.pesos.lock().unwrap();
         let dev = &self.device;
         let indices = Tensor::<2, Int>::from_data(TensorData::new(indices, [b, MAX_PECAS]), dev);
@@ -170,9 +179,30 @@ impl RedeGpu {
             }
         }
         let p: Vec<f32> = softmax(valor.expect("rede sem coluna de valor"), 1).into_data().try_into_vec().unwrap();
-        let p = p.chunks_exact(N_SAIDAS).map(|x| [x[0], x[1], x[2]]).collect();
-        let progresso = progresso.map(|t| t.into_data().try_into_vec().unwrap());
+        let p = p.chunks_exact(N_SAIDAS).take(n).map(|x| [x[0], x[1], x[2]]).collect();
+        let progresso = progresso.map(|t| {
+            let mut v: Vec<f32> = t.into_data().try_into_vec().unwrap();
+            v.truncate(n);
+            v
+        });
         (p, progresso)
+    }
+
+    // Compila os kernels de cada tamanho de lote e mede a latência (o tempo
+    // de mandar e receber um lote mínimo, que toda chamada paga)
+    pub fn aquecer(&mut self) {
+        let vazio = [crate::lote::VAZIO; MAX_PECAS];
+        let mut b = MIN_LOTE;
+        while b <= self.lote {
+            self.avaliar(&vec![vazio; b]);
+            self.avaliar(&vec![vazio; b]); // o ajuste fino ("autotune") às vezes leva duas chamadas
+            b += MIN_LOTE;
+        }
+        let t = Instant::now();
+        for _ in 0..5 {
+            self.avaliar(&[vazio]);
+        }
+        self.latencia = t.elapsed() / 5;
     }
 }
 
@@ -186,14 +216,17 @@ impl AvaliadorLote for RedeGpu {
             .map(|(k, (&p, e))| nota_da_rede(p, pecas(e), || progresso.as_ref().map(|v| v[k])))
             .collect()
     }
+    fn latencia(&self) -> Duration {
+        self.latencia
+    }
 }
 
 // -----------------------------------------------------------------
 // MEDIÇÃO (comando `medir`): avaliações por segundo na GPU, por tamanho
 // de lote e por tamanho de rede
 // -----------------------------------------------------------------
-fn por_segundo(gpu: &RedeGpu, amostra: &[Entrada]) -> f64 {
-    gpu.avaliar(&amostra[..gpu.lote.min(amostra.len())]); // aquecer (compilar os kernels)
+fn por_segundo(gpu: &mut RedeGpu, amostra: &[Entrada]) -> f64 {
+    gpu.aquecer();
     let t = Instant::now();
     let mut n = 0;
     // repete a amostra até passar de 1 s
@@ -223,17 +256,18 @@ pub fn medir(rede: &Rede, gpu: &RedeGpu, amostra: &[Entrada]) {
     let mut gpu = RedeGpu::nova(rede, device.clone());
     for lote in [1024, 4096, 16_384, 65_536] {
         gpu.lote = lote;
-        println!("  lote de {lote:>6}: {:>12.0} avaliações/s", por_segundo(&gpu, amostra));
+        let v = por_segundo(&mut gpu, amostra);
+        println!("  lote de {lote:>6}: {v:>12.0} avaliações/s   (latência de um envio: {:.1} ms)", gpu.latencia.as_secs_f64() * 1000.0);
     }
     // Na GPU a primeira camada é a multiplicação inteira (769 × largura),
     // não a atualização do acumulador: ela entra na conta
     let mil = |r: &Rede| (r.custo() + (N_ENTRADAS + 1) * r.largura) / 1000;
     println!("\nRedes maiores (pesos aleatórios, lote de {LOTE_PADRAO}); avaliações/s e mil multiplicações por avaliação na GPU:");
-    let v = por_segundo(&RedeGpu::nova(rede, device.clone()), amostra);
+    let v = por_segundo(&mut RedeGpu::nova(rede, device.clone()), amostra);
     println!("  {:>12.0} {:>6}  a sua: {}", v, mil(rede), rede.descricao());
     for (largura, densas) in [(1024, vec![32, 32]), (2048, vec![256, 32]), (4096, vec![512, 32])] {
         let r = rede_de_teste(largura, &densas);
-        let v = por_segundo(&RedeGpu::nova(&r, device.clone()), amostra);
+        let v = por_segundo(&mut RedeGpu::nova(&r, device.clone()), amostra);
         println!("  {:>12.0} {:>6}  {}", v, mil(&r), r.descricao());
     }
 }
@@ -272,7 +306,7 @@ mod testes {
                 d.w.iter_mut().for_each(|w| *w = rng.proximo() * 0.3);
             }
         }
-        let gpu = RedeGpu { lote: 7, ..RedeGpu::nova(&rede, cpu()) }; // lote pequeno: testa os pedaços
+        let gpu = RedeGpu { lote: 16, ..RedeGpu::nova(&rede, cpu()) }; // lote pequeno: testa os pedaços e o completar com vazias
         let pos = posicoes();
         let entradas: Vec<Entrada> = pos.iter().map(entrada_de).collect();
         let (probs, progresso) = gpu.avaliar(&entradas);
