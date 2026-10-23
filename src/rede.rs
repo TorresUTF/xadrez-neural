@@ -55,6 +55,21 @@
 // das "progressive networks" da DeepMind e das "zero convolutions" do
 // ControlNet.) No começo a azul fica CONGELADA (gradiente zero), para a
 // verde aprender o que falta sem estragar o que a azul já sabe.
+//
+// A COLUNA DE PROGRESSO ("rosa"): a saída V/E/D não diz COMO ganhar.
+// Num KQ vs K toda posição vale "vitória", então a busca não vê
+// diferença entre encurralar o rei e girar a dama em volta dele. A
+// coluna rosa responde outra pergunta: "quantos meios-lances faltam
+// para a vitória (ou derrota) se concretizar?". Ela tem um acumulador
+// próprio pequeno (128) e lê também o azul e o verde (congelados):
+//
+//      azul (384) + verde (384) + rosa (128) = 896 -> 32 -> 32 -> 1
+//
+// A saída dela é um número só, e não entra no softmax. Uma coluna cuja
+// última camada tem 1 saída é de progresso; com 3, de valor.
+// O alvo vem das tablebases: a DTZ da Syzygy (meios-lances até zerar a
+// contagem dos 50 lances), ou a distância até o mate nos finais de 3
+// peças de finais.rs. Unidade: 1,0 = 100 meios-lances.
 // =====================================================================
 
 use shakmaty::{Bitboard, Board, Color, Piece, Role, Square};
@@ -69,7 +84,10 @@ pub const NIVEIS: [usize; 4] = [384, 96, 32, N_SAIDAS];
 // Camadas densas da coluna verde da rede crescida (depois vem a saída)
 pub const VERDE: [usize; 2] = [64, 32];
 // O acumulador mais largo aceito (buffers fixos, sem alocação na busca)
-pub const MAX_ACUMULADOR: usize = 768;
+// Coluna de progresso: acumulador próprio e camadas (a última dá 1 número)
+pub const ACC_PROGRESSO: usize = 128;
+pub const PROGRESSO: [usize; 3] = [32, 32, 1];
+pub const MAX_ACUMULADOR: usize = 1024;
 const LARGURA: usize = MAX_ACUMULADOR; // nenhum nível é mais largo que isso
 
 pub const VITORIA: usize = 0;
@@ -118,6 +136,27 @@ pub struct Coluna {
     pub fim: usize,
     pub densas: Vec<Densa>,
     pub congelada: bool, // só no treino: não muda (não vai para o arquivo)
+}
+
+impl Coluna {
+    // coluna de progresso (1 número) em vez de valor (V/E/D)
+    pub fn de_progresso(&self) -> bool {
+        self.densas.last().unwrap().saidas == 1
+    }
+}
+
+// O que o treino quer de uma posição: a distribuição V/E/D, ou o
+// progresso (meios-lances até acabar / 100)
+#[derive(Clone, Copy)]
+pub enum Alvo {
+    Valor([f32; N_SAIDAS]),
+    Progresso(f32),
+}
+
+impl From<[f32; N_SAIDAS]> for Alvo {
+    fn from(t: [f32; N_SAIDAS]) -> Alvo {
+        Alvo::Valor(t)
+    }
 }
 
 // Os pesos.
@@ -255,6 +294,7 @@ impl Rede {
     // acumuladores e passa por VERDE e pela saída, que começa em zero:
     // a rede crescida dá exatamente as mesmas probabilidades que esta.
     pub fn crescer(&self, semente: u64) -> Rede {
+        assert!(!self.tem_progresso(), "crescer uma rede que já tem coluna de progresso");
         let (velha, nova) = (self.largura, 2 * self.largura);
         assert!(nova <= MAX_ACUMULADOR, "acumulador de {nova} passa do máximo ({MAX_ACUMULADOR})");
         let mut arq = self.arquitetura();
@@ -275,6 +315,44 @@ impl Rede {
         for d in &mut verde.densas[..n - 1] {
             d.sortear(&mut rng);
         }
+        r
+    }
+
+    pub fn tem_progresso(&self) -> bool {
+        self.colunas.iter().any(Coluna::de_progresso)
+    }
+
+    // A coluna rosa: o acumulador ganha ACC_PROGRESSO neurônios novos, e
+    // nasce uma coluna de progresso que lê o acumulador inteiro. As
+    // colunas de valor não mudam (continuam lendo o mesmo pedaço), então
+    // V/E/D sai igual ao da rede original.
+    pub fn crescer_progresso(&self, semente: u64) -> Rede {
+        assert!(!self.tem_progresso(), "a rede já tem coluna de progresso");
+        let (velha, nova) = (self.largura, self.largura + ACC_PROGRESSO);
+        assert!(nova <= MAX_ACUMULADOR, "acumulador de {nova} passa do máximo ({MAX_ACUMULADOR})");
+        let mut arq = self.arquitetura();
+        arq.push((0, nova, PROGRESSO.to_vec()));
+        let mut r = Rede::zerada(nova, &arq);
+        let mut rng = Aleatorio(semente);
+        let escala1 = 1.0 / (32.0f32).sqrt();
+        for i in 0..N_ENTRADAS {
+            r.w1[i * nova..i * nova + velha].copy_from_slice(self.coluna(i));
+            r.w1[i * nova + velha..(i + 1) * nova].iter_mut().for_each(|w| *w = rng.proximo() * escala1);
+        }
+        r.b1[..velha].copy_from_slice(&self.b1);
+        for (c, original) in r.colunas.iter_mut().zip(&self.colunas) {
+            c.densas.clone_from(&original.densas);
+        }
+        for d in &mut r.colunas.last_mut().unwrap().densas {
+            d.sortear(&mut rng);
+        }
+        r
+    }
+
+    // A mesma rede sem as colunas de progresso (para comparar)
+    pub fn sem_progresso(&self) -> Rede {
+        let mut r = self.clone();
+        r.colunas.retain(|c| !c.de_progresso());
         r
     }
 
@@ -307,7 +385,8 @@ impl Rede {
             .iter()
             .map(|c| {
                 let niveis: Vec<String> = c.densas.iter().map(|d| d.saidas.to_string()).collect();
-                format!("[{}..{}] {} -> {}", c.inicio, c.fim, c.fim - c.inicio, niveis.join(" -> "))
+                let tipo = if c.de_progresso() { " (progresso)" } else { "" };
+                format!("[{}..{}] {} -> {}{tipo}", c.inicio, c.fim, c.fim - c.inicio, niveis.join(" -> "))
             })
             .collect();
         format!("768 -> {} | {}", self.largura, colunas.join(" + "))
@@ -372,29 +451,54 @@ impl Rede {
     // Na busca isto roda milhões de vezes: só buffers fixos, sem alocação.
     // -----------------------------------------------------------------
     fn saida(&self, z1: &[f32; MAX_ACUMULADOR]) -> [f32; N_SAIDAS] {
-        let mut h0 = [0.0f32; MAX_ACUMULADOR];
-        for (h, z) in h0[..self.largura].iter_mut().zip(z1) {
-            *h = crelu(*z);
-        }
+        let h0 = self.h0(z1);
         let mut soma = [0.0f32; N_SAIDAS];
-        let (mut a, mut b) = ([0.0f32; LARGURA], [0.0f32; LARGURA]);
-        for c in &self.colunas {
-            // `ent` é a entrada da camada, `sai` a saída; depois trocam de papel
-            let (mut ent, mut sai) = (&mut a, &mut b);
-            ent[..c.fim - c.inicio].copy_from_slice(&h0[c.inicio..c.fim]);
-            let ultima = c.densas.len() - 1;
-            for (n, d) in c.densas.iter().enumerate() {
-                for (k, (s, b)) in sai.iter_mut().zip(&d.b).enumerate() {
-                    let z = b + produto(&d.w[k * d.entradas..(k + 1) * d.entradas], &ent[..d.entradas]);
-                    *s = if n == ultima { z } else { crelu(z) };
-                }
-                std::mem::swap(&mut ent, &mut sai);
-            }
-            for (s, x) in soma.iter_mut().zip(ent.iter()) {
+        for c in self.colunas.iter().filter(|c| !c.de_progresso()) {
+            for (s, x) in soma.iter_mut().zip(self.coluna_para_frente(c, &h0)) {
                 *s += x;
             }
         }
         soma
+    }
+
+    fn h0(&self, z1: &[f32; MAX_ACUMULADOR]) -> [f32; MAX_ACUMULADOR] {
+        let mut h0 = [0.0f32; MAX_ACUMULADOR];
+        for (h, z) in h0[..self.largura].iter_mut().zip(z1) {
+            *h = crelu(*z);
+        }
+        h0
+    }
+
+    // Os números da última camada de uma coluna (os primeiros `saidas`)
+    fn coluna_para_frente(&self, c: &Coluna, h0: &[f32; MAX_ACUMULADOR]) -> [f32; N_SAIDAS] {
+        let (mut a, mut b) = ([0.0f32; LARGURA], [0.0f32; LARGURA]);
+        // `ent` é a entrada da camada, `sai` a saída; depois trocam de papel
+        let (mut ent, mut sai) = (&mut a, &mut b);
+        ent[..c.fim - c.inicio].copy_from_slice(&h0[c.inicio..c.fim]);
+        let ultima = c.densas.len() - 1;
+        for (n, d) in c.densas.iter().enumerate() {
+            for (k, (s, b)) in sai.iter_mut().zip(&d.b).enumerate() {
+                let z = b + produto(&d.w[k * d.entradas..(k + 1) * d.entradas], &ent[..d.entradas]);
+                *s = if n == ultima { z } else { crelu(z) };
+            }
+            std::mem::swap(&mut ent, &mut sai);
+        }
+        std::array::from_fn(|s| ent[s])
+    }
+
+    fn progresso_z(&self, z1: &[f32; MAX_ACUMULADOR]) -> Option<f32> {
+        let c = self.colunas.iter().find(|c| c.de_progresso())?;
+        Some(self.coluna_para_frente(c, &self.h0(z1))[0])
+    }
+
+    // Meios-lances até acabar / 100, para quem joga (None: a rede não tem
+    // coluna de progresso). Só faz sentido em posição decidida.
+    pub fn progresso(&self, acc: &Acumulador, quem_joga: Color) -> Option<f32> {
+        self.progresso_z(&acc.z1[indice_cor(quem_joga)])
+    }
+
+    pub fn progresso_de(&self, ligadas: &[usize]) -> Option<f32> {
+        self.progresso_z(&self.z1_de(ligadas))
     }
 
     // (P_V, P_E, P_D) para quem joga
@@ -412,12 +516,17 @@ impl Rede {
     // Recebe as entradas ligadas (já do ponto de vista de quem joga) e o
     // alvo t = (t_V, t_E, t_D). Soma os gradientes em `g` e devolve o erro
     //      L = -soma_k t_k ln p_k        (entropia cruzada)
+    // Com alvo de progresso t, só a coluna de progresso participa, e o erro é
+    //      L = (y - t)² / 2              (dL/dy = y - t)
     // É a mesma regra da cadeia da Etapa 0, repetida camada a camada.
     // Partes congeladas não recebem gradiente (e por isso não mudam).
     // -----------------------------------------------------------------
     // os índices k e j seguem as fórmulas, por isso laços com índice
     #[allow(clippy::needless_range_loop)]
-    pub fn retropropagar(&self, ligadas: &[usize], alvo: [f32; N_SAIDAS], g: &mut Rede) -> f32 {
+    pub fn retropropagar(&self, ligadas: &[usize], alvo: impl Into<Alvo>, g: &mut Rede) -> f32 {
+        let alvo = alvo.into();
+        // as colunas que este alvo treina
+        let participa = |c: &Coluna| c.de_progresso() == matches!(alvo, Alvo::Progresso(_));
         // Passo para frente guardando os z de cada camada de cada coluna
         let z0 = self.z1_de(ligadas);
         let h0: Vec<f32> = z0[..self.largura].iter().map(|&z| crelu(z)).collect();
@@ -427,6 +536,9 @@ impl Rede {
             .iter()
             .map(|c| {
                 let mut zs: Vec<Vec<f32>> = Vec::with_capacity(c.densas.len());
+                if !participa(c) {
+                    return zs;
+                }
                 let mut h = h0[c.inicio..c.fim].to_vec();
                 for d in &c.densas {
                     let z: Vec<f32> =
@@ -440,13 +552,18 @@ impl Rede {
                 zs
             })
             .collect();
-        let p = softmax(&soma);
-        let erro = -(0..N_SAIDAS).map(|s| alvo[s] * p[s].max(1e-12).ln()).sum::<f32>();
-
-        // 1) Saída: com softmax + entropia cruzada, dL/dz = p - t
-        //    (o mesmo cancelamento do y - t da Etapa 0). Como a saída é a
-        //    SOMA das colunas, cada coluna recebe esse mesmo erro.
-        let delta_saida: Vec<f32> = (0..N_SAIDAS).map(|s| p[s] - alvo[s]).collect();
+        // (a coluna de progresso tem 1 saída: soma[0] é o y dela)
+        let (erro, delta_saida) = match alvo {
+            // 1) Saída: com softmax + entropia cruzada, dL/dz = p - t
+            //    (o mesmo cancelamento do y - t da Etapa 0). Como a saída é a
+            //    SOMA das colunas, cada coluna recebe esse mesmo erro.
+            Alvo::Valor(t) => {
+                let p = softmax(&soma);
+                let erro = -(0..N_SAIDAS).map(|s| t[s] * p[s].max(1e-12).ln()).sum::<f32>();
+                (erro, (0..N_SAIDAS).map(|s| p[s] - t[s]).collect::<Vec<f32>>())
+            }
+            Alvo::Progresso(t) => (0.5 * (soma[0] - t) * (soma[0] - t), vec![soma[0] - t]),
+        };
         let mut delta0 = vec![0.0f32; self.largura]; // erro no acumulador
 
         // 2) Em cada coluna, de trás para frente, camada densa por camada densa:
@@ -455,7 +572,7 @@ impl Rede {
         //      delta_ant_j   = (soma_k W_n[k][j] · delta_k) · CReLU'(z[n-1]_j)
         //    O erro "volta" pelos mesmos pesos que o sinal usou para ir.
         for ((c, zs), gc) in self.colunas.iter().zip(&zs).zip(&mut g.colunas) {
-            if c.congelada && c.fim <= self.congelado {
+            if !participa(c) || (c.congelada && c.fim <= self.congelado) {
                 continue; // nada aqui nem atrás daqui muda
             }
             let mut delta = delta_saida.clone();
@@ -543,12 +660,12 @@ impl Rede {
     // número a número, então o resultado é o mesmo de `aplicar_adam`
     // com o laço simples (a menos de arredondamento).
     // Devolve o erro total do lote.
-    pub fn treinar_lote<T: Sync>(
+    pub fn treinar_lote<T: Sync, A: Into<Alvo>>(
         &mut self,
         gs: &mut [Rede],
         adam: &mut Adam,
         lote: &[T],
-        exemplo: impl Fn(&T) -> (&[usize], [f32; N_SAIDAS]) + Sync,
+        exemplo: impl Fn(&T) -> (&[usize], A) + Sync,
     ) -> f64 {
         let por_thread = lote.len().div_ceil(gs.len()).max(1);
         let usados = lote.len().div_ceil(por_thread);
@@ -698,12 +815,15 @@ impl Rede {
             let niveis = (0..n).map(|_| ler()).collect::<io::Result<Vec<usize>>>()?;
             let ok = inicio < fim
                 && fim <= largura
-                && niveis.last() == Some(&N_SAIDAS)
+                && matches!(niveis.last(), Some(&N_SAIDAS) | Some(&1))
                 && niveis.iter().all(|&x| (1..=LARGURA).contains(&x));
             if !ok {
                 return Err(invalido(format!("coluna inválida: {inicio}..{fim} {niveis:?}")));
             }
             arq.push((inicio, fim, niveis));
+        }
+        if arq.iter().all(|(_, _, n)| n.last() == Some(&1)) {
+            return Err(invalido("rede sem coluna de valor".into()));
         }
         let tamanho = 4 + 4 * (2 + arq.iter().map(|(_, _, n)| 3 + n.len()).sum::<usize>());
         Ok((Rede::zerada(largura, &arq), tamanho))

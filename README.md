@@ -20,6 +20,8 @@ cargo run --release -- torneio auto3.rede ab:200ms "uci=lc0\lc0.exe --weights=lc
 cargo run --release -- crescer auto3.rede crescida.rede         # rede crescida: auto3 + uma coluna nova (nasce igual à auto3)
 cargo run --release -- autojogo 300 64 crescida2.rede crescida.rede syzygy --congelar     # treina só a coluna nova
 cargo run --release -- autojogo 300 64 crescida3.rede crescida2.rede syzygy --taxa=0.0003 # depois, tudo junto com passo menor
+cargo run --release -- progresso crescida3.rede rosa.rede syzygy   # coluna de progresso: "quantos lances até acabar" (precisa das .rtbz: baixar_syzygy.ps1 -Dtz)
+cargo run --release -- progresso crescida3.rede rosa.rede          # idem, só com KQK e KRK (sem download)
 ```
 
 Para usar as tablebases: rode `powershell -ExecutionPolicy Bypass -File baixar_syzygy.ps1`, que baixa os arquivos `.rtbw` de até 5 peças para a pasta `syzygy`, e rode `cargo test --release` (o teste `syzygy_concorda_com_o_gabarito_de_3_pecas` confere a Syzygy contra o nosso gabarito).
@@ -35,6 +37,7 @@ O `.cargo/config.toml` compila para o processador da máquina (`target-cpu=nativ
 - `src/treino.rs`: treino supervisionado em lotes, com 10% das posições separadas para validação.
 - `src/syzygy.rs`: sorteia posições de cada combinação de material até 5 (ou 6) peças e rotula com as tablebases Syzygy.
 - `src/certeza.rs`: busca guiada pela certeza: a árvore cresce onde a rede está em dúvida (V/E/D), e para onde ela tem certeza.
+- `src/progresso.rs`: treina a coluna de progresso com a distância até o mate (linhas da Syzygy, ou KQK/KRK) e compara partidas com e sem ela.
 - `src/torneio.rs`: torneio entre métodos de escolher o lance (`ab:3`, `ab:200ms`, `mat:3`, `cert:200ms`), com aberturas pareadas e diferença de Elo com margem de erro.
 - `src/externo.rs`: conversa com outro motor pelo protocolo UCI (Etapa 4: o Maia rodando no lc0).
 - `src/paralelo.rs`: divide o trabalho entre as threads por uma fila, para nenhum núcleo ficar parado.
